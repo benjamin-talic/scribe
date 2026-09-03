@@ -3,7 +3,18 @@ import SwiftUI
 
 @main
 struct ScribeApp: App {
-    @State private var state = AppState()
+    @State private var state: AppState
+
+    init() {
+        let state: AppState
+        do {
+            state = AppState(sessionStore: try SessionStore())
+        } catch {
+            state = AppState(storageError: error.localizedDescription)
+        }
+        _state = State(initialValue: state)
+        Task { await state.restoreSessions() }
+    }
 
     var body: some Scene {
         MenuBarExtra {
@@ -61,6 +72,11 @@ private struct MenuView: View {
                     systemImage: "text.badge.clock"
                 )
                 .foregroundStyle(.secondary)
+            }
+
+            if let storageError = state.storageError {
+                Label(storageError, systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(.red)
             }
 
             Divider()
