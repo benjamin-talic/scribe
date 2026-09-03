@@ -1,0 +1,10 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["@dietrichgebert/ponytail"],
+  "permission": {
+    "skill": {
+      "*": "allow",
+      "delegate-to-toki": "deny"
+    }
+  }
+}
