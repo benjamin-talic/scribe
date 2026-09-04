@@ -21,14 +21,17 @@ final class AppState {
     private var recordingStartInProgress = false
     private let sessionStore: SessionStore?
     private let recorder: (any RecordingControlling)?
+    private let processingQueue: ProcessingQueue?
 
     init(
         sessionStore: SessionStore? = nil,
         recorder: (any RecordingControlling)? = nil,
+        processingQueue: ProcessingQueue? = nil,
         storageError: String? = nil
     ) {
         self.sessionStore = sessionStore
         self.recorder = recorder
+        self.processingQueue = processingQueue
         self.storageError = storageError
     }
 
@@ -55,6 +58,7 @@ final class AppState {
             pendingTranscriptions = scan.pendingTranscriptionCount
             let warnings = Set(recoveryWarnings + scan.warnings).sorted()
             storageError = warnings.isEmpty ? nil : warnings.joined(separator: "\n")
+            processPendingTranscriptions()
         } catch {
             storageError = error.localizedDescription
         }
@@ -97,6 +101,7 @@ final class AppState {
             recordingApplication = nil
             pendingTranscriptions = try await sessionStore?.pendingTranscriptionCount() ?? 0
             recordingError = nil
+            processPendingTranscriptions()
         } catch {
             recordingState = .idle
             recordingApplication = nil
@@ -122,5 +127,17 @@ final class AppState {
         endedApplication: MeetingApplication
     ) -> Bool {
         recordingApplication == endedApplication
+    }
+
+    private func processPendingTranscriptions() {
+        guard let processingQueue, let sessionStore else { return }
+        Task { [weak self] in
+            do {
+                try await processingQueue.processPendingTranscriptions()
+                self?.pendingTranscriptions = try await sessionStore.pendingTranscriptionCount()
+            } catch {
+                self?.storageError = error.localizedDescription
+            }
+        }
     }
 }

@@ -3,6 +3,7 @@ import AVFAudio
 import AVFoundation
 import CoreAudio
 import Foundation
+import os
 
 @MainActor
 protocol RecordingControlling: AnyObject {
@@ -101,9 +102,13 @@ final class RecordingController: RecordingControlling {
 }
 
 private final class AudioFileWriter: @unchecked Sendable {
+    private struct State {
+        var failure: String?
+        var firstHostTime: UInt64?
+    }
+
     private let file: ExtAudioFileRef
-    private var storedFailure: String?
-    private var storedFirstHostTime: UInt64?
+    private let state = OSAllocatedUnfairLock(initialState: State())
 
     init(url: URL, format: AVAudioFormat) throws {
         var streamDescription = format.streamDescription.pointee
@@ -135,13 +140,15 @@ private final class AudioFileWriter: @unchecked Sendable {
     }
 
     func write(_ buffers: UnsafePointer<AudioBufferList>, frames: UInt32, hostTime: UInt64) {
-        if hostTime != 0 { storedFirstHostTime = storedFirstHostTime ?? hostTime }
         let status = ExtAudioFileWriteAsync(file, frames, buffers)
-        if status != noErr { storedFailure = storedFailure ?? "Audio file write failed with status \(status)." }
+        state.withLock {
+            if hostTime != 0 { $0.firstHostTime = $0.firstHostTime ?? hostTime }
+            if status != noErr { $0.failure = $0.failure ?? "Audio file write failed with status \(status)." }
+        }
     }
 
-    var firstHostTime: UInt64? { storedFirstHostTime }
-    var failure: String? { storedFailure }
+    var firstHostTime: UInt64? { state.withLock { $0.firstHostTime } }
+    var failure: String? { state.withLock { $0.failure } }
 
     deinit {
         ExtAudioFileDispose(file)

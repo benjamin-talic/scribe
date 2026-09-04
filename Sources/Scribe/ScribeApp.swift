@@ -11,7 +11,11 @@ struct ScribeApp: App {
         let state: AppState
         do {
             let store = try SessionStore()
-            state = AppState(sessionStore: store, recorder: RecordingController(sessionStore: store))
+            state = AppState(
+                sessionStore: store,
+                recorder: RecordingController(sessionStore: store),
+                processingQueue: ProcessingQueue(sessionStore: store)
+            )
         } catch {
             state = AppState(storageError: error.localizedDescription)
         }
