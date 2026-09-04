@@ -5,11 +5,11 @@ import UserNotifications
 final class MeetingNotifications: NSObject, UNUserNotificationCenterDelegate {
     private static let category = "meeting-detected"
     private nonisolated static let startAction = "start-recording"
-    private nonisolated static let ignoreAction = "ignore-meeting"
+    private nonisolated static let closeAction = "close-notification"
     private let center = UNUserNotificationCenter.current()
     private var isAuthorized = false
 
-    var onStart: ((MeetingApplication) -> Void)?
+    var onStart: ((MeetingApplication) async -> Void)?
 
     func configure() {
         center.delegate = self
@@ -17,8 +17,8 @@ final class MeetingNotifications: NSObject, UNUserNotificationCenterDelegate {
             UNNotificationCategory(
                 identifier: Self.category,
                 actions: [
-                    UNNotificationAction(identifier: Self.startAction, title: "Start Recording", options: .foreground),
-                    UNNotificationAction(identifier: Self.ignoreAction, title: "Ignore"),
+                    UNNotificationAction(identifier: Self.startAction, title: "Start Recording"),
+                    UNNotificationAction(identifier: Self.closeAction, title: "Close"),
                 ],
                 intentIdentifiers: []
             ),
@@ -54,19 +54,19 @@ final class MeetingNotifications: NSObject, UNUserNotificationCenterDelegate {
 
     nonisolated func userNotificationCenter(
         _: UNUserNotificationCenter,
-        didReceive response: UNNotificationResponse,
-        withCompletionHandler completionHandler: @escaping () -> Void
-    ) {
+        didReceive response: UNNotificationResponse
+    ) async {
         let action = response.actionIdentifier
         let identifier = response.notification.request.identifier
         let bundleID = response.notification.request.content.userInfo["bundleID"] as? String
         let name = response.notification.request.content.userInfo["name"] as? String
-        completionHandler()
-        Task { @MainActor [weak self] in
-            self?.center.removeDeliveredNotifications(withIdentifiers: [identifier])
-            guard action == Self.startAction, let bundleID, let name else { return }
-            self?.onStart?(MeetingApplication(bundleID: bundleID, name: name))
-        }
+        await handle(action: action, identifier: identifier, bundleID: bundleID, name: name)
+    }
+
+    private func handle(action: String, identifier: String, bundleID: String?, name: String?) async {
+        center.removeDeliveredNotifications(withIdentifiers: [identifier])
+        guard action == Self.startAction, let bundleID, let name else { return }
+        await onStart?(MeetingApplication(bundleID: bundleID, name: name))
     }
 
     private func identifier(for application: MeetingApplication) -> String {

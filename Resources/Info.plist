@@ -6,6 +6,8 @@
     <string>en</string>
     <key>CFBundleExecutable</key>
     <string>Scribe</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
     <string>local.scribe.app</string>
     <key>CFBundleInfoDictionaryVersion</key>

@@ -43,6 +43,7 @@ struct AppStateTests {
         await state.restoreSessions(at: Date(timeIntervalSince1970: 10))
 
         #expect(state.pendingTranscriptions == 1)
+        #expect(state.transcriptionFailures.map(\.id) == ["meeting"])
         #expect(state.storageError?.contains("broken") == true)
     }
 

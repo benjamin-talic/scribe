@@ -6,9 +6,10 @@ swift build --package-path "$root" -c release
 
 app="$root/.build/Scribe.app"
 rm -rf "$app"
-mkdir -p "$app/Contents/MacOS"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$root/.build/release/Scribe" "$app/Contents/MacOS/Scribe"
 cp "$root/Resources/Info.plist" "$app/Contents/Info.plist"
+cp "$root/Resources/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
 codesign \
     --force \
     --options runtime \

@@ -129,6 +129,148 @@ struct SessionStoreTests {
         #expect(try await store.allSessions().isEmpty)
     }
 
+    @Test
+    func placePersistsAndMoveAvoidsExistingFile() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let destination = root.appending(path: "team", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        let store = try SessionStore(rootURL: root)
+        let place = try await store.addPlace(name: "Team", directory: destination)
+        await #expect(throws: SessionStore.Error.self) {
+            try await store.addPlace(name: "Team Alias", directory: destination)
+        }
+
+        try await store.createSession(sourceApplication: "Zoom", startedAt: Date(timeIntervalSince1970: 1_000), id: "meeting")
+        try await store.transition("meeting", to: .pendingTranscription)
+        try await store.transition("meeting", to: .transcribing)
+        try await store.transition("meeting", to: .transcribed)
+        try await store.transition("meeting", to: .generatingNotes)
+        let noteURL = try await store.writeNotes(
+            "meeting",
+            generated: "# Weekly Sync\n\n## Notes\n\nSummary.",
+            transcript: "00:00 Me: Hello"
+        )
+        try Data("existing".utf8).write(to: destination.appending(path: noteURL.lastPathComponent))
+
+        let note = try #require(try await store.librarySnapshot().notes.first)
+        try await store.moveNote(note, to: place.id)
+
+        let reloaded = try await SessionStore(rootURL: root).librarySnapshot()
+        let moved = try #require(reloaded.notes.first)
+        #expect(reloaded.places == [place])
+        #expect(moved.placeID == place.id)
+        #expect(moved.url.lastPathComponent.hasSuffix("-2.md"))
+        let movedMarkdown = try String(contentsOf: moved.url, encoding: .utf8)
+        #expect(movedMarkdown.contains("place: \"Inbox\""))
+        #expect(try String(contentsOf: destination.appending(path: noteURL.lastPathComponent), encoding: .utf8) == "existing")
+
+        try await store.renamePlace(place.id, to: "Team Sync")
+        let renamed = try await store.librarySnapshot()
+        #expect(renamed.places.first?.name == "Team Sync")
+        #expect(try String(contentsOf: moved.url, encoding: .utf8) == movedMarkdown)
+    }
+
+    @Test
+    func interruptedNotesNeverAdoptOrOverwriteAnotherFile() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try SessionStore(rootURL: root)
+        try await store.createSession(sourceApplication: "Zoom", id: "meeting")
+        try await store.transition("meeting", to: .pendingTranscription)
+        try await store.transition("meeting", to: .transcribing)
+        try await store.transition("meeting", to: .transcribed)
+        try await store.transition("meeting", to: .generatingNotes)
+
+        let paths = try await store.sessionPaths(for: "meeting")
+        let unrelated = root.appending(path: "inbox/reserved.md")
+        try Data("unrelated".utf8).write(to: unrelated)
+        var session = try #require(try await store.allSessions().first)
+        session.finalNotePath = unrelated.path
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(session).write(to: paths.metadata, options: .atomic)
+
+        _ = try await store.recoverInterruptedWork()
+        let recovered = try #require(try await store.allSessions().first)
+        #expect(recovered.stage == .transcribed)
+        try await store.transition("meeting", to: .generatingNotes)
+        let written = try await store.writeNotes(
+            "meeting",
+            generated: "# Safe Note\n\n## Notes\n\nSummary.",
+            transcript: "00:00 Me: Hello"
+        )
+
+        #expect(written != unrelated)
+        #expect(try String(contentsOf: unrelated, encoding: .utf8) == "unrelated")
+    }
+
+    @Test
+    func expiredAudioCleanupKeepsOnlyDurableRecordsAndRetryState() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try SessionStore(rootURL: root)
+        let old = Date(timeIntervalSince1970: 1_000)
+        let cleanupDate = old.addingTimeInterval(6 * 24 * 60 * 60)
+
+        for id in ["complete", "embedded", "retry", "recent"] {
+            try await store.createSession(sourceApplication: "Zoom", startedAt: old, id: id)
+            try await store.transition(id, to: .pendingTranscription)
+            try await store.transition(id, to: .transcribing)
+            try await store.transition(
+                id,
+                to: .transcribed,
+                at: id == "recent" ? cleanupDate.addingTimeInterval(-5 * 24 * 60 * 60) : old
+            )
+            let paths = try await store.sessionPaths(for: id)
+            try Data("audio".utf8).write(to: paths.meAudio)
+            try Data("audio".utf8).write(to: paths.othersAudio)
+            try Data("transcript".utf8).write(to: paths.transcript)
+        }
+        try await store.transition("complete", to: .generatingNotes)
+        let note = try await store.writeNotes(
+            "complete",
+            generated: "# Complete\n\n## Notes\n\nSummary.",
+            transcript: "00:00 Me: Hello",
+            at: old
+        )
+        try await store.transition("embedded", to: .generatingNotes)
+        let embeddedPublished = try await store.writeNotes(
+            "embedded",
+            generated: "# Embedded\n\n## Notes\n\nSummary.",
+            transcript: "00:00 Me: Hello",
+            at: old
+        )
+        let embeddedPaths = try await store.sessionPaths(for: "embedded")
+        let embeddedNote = embeddedPaths.directory.appending(path: embeddedPublished.lastPathComponent)
+        try FileManager.default.moveItem(at: embeddedPublished, to: embeddedNote)
+        var embeddedSession = try #require(try await store.allSessions().first { $0.id == "embedded" })
+        embeddedSession.finalNotePath = embeddedNote.path
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(embeddedSession).write(to: embeddedPaths.metadata, options: .atomic)
+
+        await #expect(throws: SessionStore.Error.self) {
+            try await store.addPlace(name: "Internal", directory: embeddedPaths.directory)
+        }
+
+        #expect(try await store.cleanupExpiredAudio(at: cleanupDate).isEmpty)
+
+        #expect(FileManager.default.fileExists(atPath: note.path))
+        await #expect(throws: SessionStore.Error.self) { try await store.sessionPaths(for: "complete") }
+        let retryPaths = try await store.sessionPaths(for: "retry")
+        #expect(FileManager.default.fileExists(atPath: retryPaths.metadata.path))
+        #expect(FileManager.default.fileExists(atPath: retryPaths.transcript.path))
+        #expect(!FileManager.default.fileExists(atPath: retryPaths.meAudio.path))
+        #expect(!FileManager.default.fileExists(atPath: retryPaths.othersAudio.path))
+        #expect(FileManager.default.fileExists(atPath: embeddedNote.path))
+        #expect(!FileManager.default.fileExists(atPath: embeddedPaths.meAudio.path))
+        #expect(!FileManager.default.fileExists(atPath: embeddedPaths.othersAudio.path))
+        let recentPaths = try await store.sessionPaths(for: "recent")
+        #expect(FileManager.default.fileExists(atPath: recentPaths.meAudio.path))
+        #expect(FileManager.default.fileExists(atPath: recentPaths.othersAudio.path))
+    }
+
     private func temporaryDirectory() -> URL {
         FileManager.default.temporaryDirectory
             .appending(path: "scribe-tests-\(UUID().uuidString)", directoryHint: .isDirectory)

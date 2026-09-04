@@ -14,11 +14,17 @@ final class AppState {
     var storageError: String?
     var meetingDetectionError: String?
     var recordingError: String?
+    var notesClient: NotesClient = .openCode
+    var places: [Place] = []
+    var notes: [MeetingNote] = []
+    var transcriptionFailures: [RecordingSession] = []
+    var noteGenerationFailures: [RecordingSession] = []
     var activeMeetingApplications: Set<MeetingApplication> = []
     var requestedRecordingApplication: MeetingApplication?
     var requestedAutomaticStopApplication: MeetingApplication?
     private var recordingApplication: MeetingApplication?
     private var recordingStartInProgress = false
+    private var recordingStopInProgress = false
     private let sessionStore: SessionStore?
     private let recorder: (any RecordingControlling)?
     private let processingQueue: ProcessingQueue?
@@ -54,11 +60,28 @@ final class AppState {
 
         do {
             let recoveryWarnings = try await sessionStore.recoverInterruptedWork(at: date)
+            let cleanupWarnings = try await sessionStore.cleanupExpiredAudio(at: date)
             let scan = try await sessionStore.scanSessions()
             pendingTranscriptions = scan.pendingTranscriptionCount
-            let warnings = Set(recoveryWarnings + scan.warnings).sorted()
+            transcriptionFailures = scan.sessions.filter { $0.stage == .pendingTranscription && $0.lastError != nil }
+            noteGenerationFailures = scan.sessions.filter { $0.stage == .transcribed && $0.lastError != nil }
+            let library = try await sessionStore.librarySnapshot()
+            notesClient = library.notesClient
+            places = library.places
+            notes = library.notes
+            let warnings = Set(recoveryWarnings + cleanupWarnings + scan.warnings + library.warnings).sorted()
             storageError = warnings.isEmpty ? nil : warnings.joined(separator: "\n")
-            processPendingTranscriptions()
+        } catch {
+            storageError = error.localizedDescription
+        }
+        processPendingTranscriptions()
+    }
+
+    func performMaintenance(at date: Date = .now) async {
+        guard let sessionStore else { return }
+        do {
+            let warnings = try await sessionStore.cleanupExpiredAudio(at: date)
+            if !warnings.isEmpty { storageError = warnings.joined(separator: "\n") }
         } catch {
             storageError = error.localizedDescription
         }
@@ -93,7 +116,9 @@ final class AppState {
     }
 
     func stopRecording(at date: Date = .now) async {
-        guard let recorder, isRecording else { return }
+        guard let recorder, isRecording, !recordingStopInProgress else { return }
+        recordingStopInProgress = true
+        defer { recordingStopInProgress = false }
 
         do {
             _ = try await recorder.stop(at: date)
@@ -106,7 +131,7 @@ final class AppState {
             recordingState = .idle
             recordingApplication = nil
             recordingError = error.localizedDescription
-            await restoreSessions(at: date)
+            await loadLibrary()
         }
     }
 
@@ -122,6 +147,81 @@ final class AppState {
         activeMeetingApplications.count == 1 ? activeMeetingApplications.first : nil
     }
 
+    func loadLibrary() async {
+        guard let sessionStore else { return }
+        do {
+            let library = try await sessionStore.librarySnapshot()
+            notesClient = library.notesClient
+            places = library.places
+            notes = library.notes
+            let sessions = try await sessionStore.allSessions()
+            transcriptionFailures = sessions.filter { $0.stage == .pendingTranscription && $0.lastError != nil }
+            noteGenerationFailures = sessions.filter { $0.stage == .transcribed && $0.lastError != nil }
+            if !library.warnings.isEmpty { storageError = library.warnings.joined(separator: "\n") }
+        } catch {
+            storageError = error.localizedDescription
+        }
+    }
+
+    func setNotesClient(_ client: NotesClient) async {
+        guard let sessionStore else { return }
+        do {
+            try await sessionStore.setNotesClient(client)
+            notesClient = client
+            storageError = nil
+        } catch {
+            storageError = error.localizedDescription
+        }
+    }
+
+    func addPlace(name: String, directory: URL) async {
+        guard let sessionStore else { return }
+        do {
+            try await sessionStore.addPlace(name: name, directory: directory)
+            storageError = nil
+            await loadLibrary()
+        } catch {
+            storageError = error.localizedDescription
+        }
+    }
+
+    func renamePlace(_ id: UUID, to name: String) async {
+        guard let sessionStore else { return }
+        do {
+            try await sessionStore.renamePlace(id, to: name)
+            storageError = nil
+            await loadLibrary()
+        } catch {
+            storageError = error.localizedDescription
+        }
+    }
+
+    func removePlace(_ id: UUID) async {
+        guard let sessionStore else { return }
+        do {
+            try await sessionStore.removePlace(id)
+            storageError = nil
+            await loadLibrary()
+        } catch {
+            storageError = error.localizedDescription
+        }
+    }
+
+    func moveNote(_ note: MeetingNote, to placeID: UUID?) async {
+        guard let sessionStore else { return }
+        do {
+            try await sessionStore.moveNote(note, to: placeID)
+            storageError = nil
+            await loadLibrary()
+        } catch {
+            storageError = error.localizedDescription
+        }
+    }
+
+    func retryFailedProcessing() {
+        processPendingTranscriptions()
+    }
+
     static func shouldAutomaticallyStop(
         recordingApplication: MeetingApplication?,
         endedApplication: MeetingApplication
@@ -135,6 +235,7 @@ final class AppState {
             do {
                 try await processingQueue.processPendingTranscriptions()
                 self?.pendingTranscriptions = try await sessionStore.pendingTranscriptionCount()
+                await self?.loadLibrary()
             } catch {
                 self?.storageError = error.localizedDescription
             }

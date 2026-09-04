@@ -6,6 +6,8 @@ plist="$app/Contents/Info.plist"
 
 plutil -lint "$plist" >/dev/null
 [[ "$(plutil -extract CFBundleIdentifier raw -o - "$plist")" == "local.scribe.app" ]]
+[[ "$(plutil -extract CFBundleIconFile raw -o - "$plist")" == "AppIcon" ]]
+[[ -f "$app/Contents/Resources/AppIcon.icns" ]]
 [[ "$(plutil -extract LSUIElement raw -o - "$plist")" == "true" ]]
 plutil -extract NSMicrophoneUsageDescription raw -o - "$plist" >/dev/null
 plutil -extract NSAudioCaptureUsageDescription raw -o - "$plist" >/dev/null
