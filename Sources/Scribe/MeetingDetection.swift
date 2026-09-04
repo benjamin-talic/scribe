@@ -130,6 +130,17 @@ struct CoreAudioMicScanner {
         return active
     }
 
+    func processObjectIDs(for application: MeetingApplication) throws -> [AudioObjectID] {
+        try processObjectIDs().filter { objectID in
+            guard objectID != kAudioObjectUnknown, let pid = try? readPID(objectID) else { return false }
+            return configuredApplication(
+                for: pid,
+                processObjectID: objectID,
+                configured: [application]
+            ) != nil
+        }
+    }
+
     private func configuredApplication(
         for pid: pid_t,
         processObjectID: AudioObjectID,

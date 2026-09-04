@@ -93,6 +93,42 @@ struct SessionStoreTests {
         #expect(try await store.allSessions().map(\.id) == ["valid"])
     }
 
+    @Test
+    func finishingRecordingPersistsTrackOffsets() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let store = try SessionStore(rootURL: root)
+        try await store.createSession(sourceApplication: "Zoom", id: "timed")
+
+        let session = try await store.finishRecording(
+            "timed",
+            at: Date(timeIntervalSince1970: 100),
+            meStartHostTime: 123,
+            othersStartHostTime: 456
+        )
+
+        #expect(session.stage == .pendingTranscription)
+        #expect(session.meStartHostTime == 123)
+        #expect(session.othersStartHostTime == 456)
+        #expect(try await SessionStore(rootURL: root).allSessions() == [session])
+    }
+
+    @Test
+    func discardingFailedStartRemovesItsSessionDirectory() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let store = try SessionStore(rootURL: root)
+        try await store.createSession(sourceApplication: nil, id: "failed")
+        let directory = try await store.sessionPaths(for: "failed").directory
+
+        try await store.discardRecording("failed")
+
+        #expect(!FileManager.default.fileExists(atPath: directory.path))
+        #expect(try await store.allSessions().isEmpty)
+    }
+
     private func temporaryDirectory() -> URL {
         FileManager.default.temporaryDirectory
             .appending(path: "scribe-tests-\(UUID().uuidString)", directoryHint: .isDirectory)

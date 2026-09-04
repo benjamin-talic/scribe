@@ -16,6 +16,8 @@ struct RecordingSession: Codable, Equatable, Identifiable, Sendable {
     var endedAt: Date?
     var transcribedAt: Date?
     var notesAt: Date?
+    var meStartHostTime: UInt64?
+    var othersStartHostTime: UInt64?
     var stage: Stage
     var lastError: String?
 }
@@ -93,6 +95,45 @@ actor SessionStore {
             try? fileManager.removeItem(at: directory)
             throw error
         }
+        return session
+    }
+
+    func sessionPaths(for id: String) throws -> SessionPaths {
+        guard !id.isEmpty, id.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-") }) else {
+            throw Error.invalidID(id)
+        }
+        guard fileManager.fileExists(atPath: paths(for: id).directory.path) else {
+            throw Error.missingSession(id)
+        }
+        return paths(for: id)
+    }
+
+    func discardRecording(_ id: String) throws {
+        let session = try load(id)
+        guard session.stage == .recording else {
+            throw Error.invalidTransition(from: session.stage, to: .recording)
+        }
+        try fileManager.removeItem(at: paths(for: id).directory)
+    }
+
+    @discardableResult
+    func finishRecording(
+        _ id: String,
+        at date: Date = .now,
+        meStartHostTime: UInt64?,
+        othersStartHostTime: UInt64?,
+        error: String? = nil
+    ) throws -> RecordingSession {
+        var session = try load(id)
+        guard session.stage == .recording else {
+            throw Error.invalidTransition(from: session.stage, to: .pendingTranscription)
+        }
+        session.endedAt = date
+        session.meStartHostTime = meStartHostTime
+        session.othersStartHostTime = othersStartHostTime
+        session.stage = .pendingTranscription
+        session.lastError = error
+        try write(session)
         return session
     }
 

@@ -10,7 +10,8 @@ struct ScribeApp: App {
     init() {
         let state: AppState
         do {
-            state = AppState(sessionStore: try SessionStore())
+            let store = try SessionStore()
+            state = AppState(sessionStore: store, recorder: RecordingController(sessionStore: store))
         } catch {
             state = AppState(storageError: error.localizedDescription)
         }
@@ -22,6 +23,7 @@ struct ScribeApp: App {
         meetingNotifications = notifications
         notifications.onStart = { [weak state] application in
             state?.requestedRecordingApplication = application
+            Task { await state?.startRecording(for: application) }
         }
         notifications.configure()
         detector.onEvent = { [weak state, weak notifications] event in
@@ -29,7 +31,9 @@ struct ScribeApp: App {
             state?.handleMeetingEvent(event)
             switch event {
             case let .started(application): notifications.offerRecording(for: application)
-            case let .ended(application): notifications.clearOffer(for: application)
+            case let .ended(application):
+                notifications.clearOffer(for: application)
+                Task { await state?.stopRecording(ifMeetingEnded: application) }
             }
         }
         detector.onError = { [weak state] error in
@@ -118,7 +122,25 @@ private struct MenuView: View {
                     .foregroundStyle(.red)
             }
 
+            if let recordingError = state.recordingError {
+                Label(recordingError, systemImage: "waveform.badge.exclamationmark")
+                    .foregroundStyle(.red)
+            }
+
             Divider()
+
+            if state.isRecording {
+                Button("Stop Recording") {
+                    Task { await state.stopRecording() }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.red)
+            } else {
+                Button("Start Recording") {
+                    Task { await state.startRecording(for: state.manualRecordingApplication) }
+                }
+                .buttonStyle(.borderedProminent)
+            }
 
             Button("Open Scribe") {
                 openWindow(id: "library")
@@ -127,7 +149,10 @@ private struct MenuView: View {
             .buttonStyle(.borderedProminent)
 
             Button("Quit") {
-                NSApp.terminate(nil)
+                Task {
+                    await state.stopRecording()
+                    NSApp.terminate(nil)
+                }
             }
             .buttonStyle(.plain)
         }

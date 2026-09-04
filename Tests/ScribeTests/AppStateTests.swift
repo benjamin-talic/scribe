@@ -57,4 +57,54 @@ struct AppStateTests {
         #expect(state.activeMeetingApplications.isEmpty)
         #expect(state.requestedAutomaticStopApplication == zoom)
     }
+
+    @Test
+    func automaticStopOnlyMatchesTheRecordedApplication() {
+        let zoom = MeetingApplication(bundleID: "us.zoom.xos", name: "Zoom")
+        let arc = MeetingApplication(bundleID: "company.thebrowser.Browser", name: "Arc")
+
+        #expect(AppState.shouldAutomaticallyStop(recordingApplication: zoom, endedApplication: zoom))
+        #expect(!AppState.shouldAutomaticallyStop(recordingApplication: zoom, endedApplication: arc))
+        #expect(!AppState.shouldAutomaticallyStop(recordingApplication: nil, endedApplication: zoom))
+    }
+
+    @Test
+    func appStateCoordinatesRecordingLifecycle() async {
+        let recorder = FakeRecorder()
+        let state = AppState(recorder: recorder)
+        let zoom = MeetingApplication(bundleID: "us.zoom.xos", name: "Zoom")
+        let start = Date(timeIntervalSince1970: 100)
+
+        await state.startRecording(for: zoom, at: start)
+        #expect(state.recordingState == .recording(startedAt: start))
+
+        await state.stopRecording(ifMeetingEnded: zoom, at: start.addingTimeInterval(10))
+        #expect(state.recordingState == .idle)
+        #expect(recorder.stopCount == 1)
+    }
+}
+
+@MainActor
+private final class FakeRecorder: RecordingControlling {
+    var stopCount = 0
+
+    func start(for application: MeetingApplication?, at date: Date) async throws -> RecordingSession {
+        RecordingSession(
+            id: "fake",
+            sourceApplication: application?.name,
+            startedAt: date,
+            stage: .recording
+        )
+    }
+
+    func stop(at date: Date) async throws -> RecordingSession {
+        stopCount += 1
+        return RecordingSession(
+            id: "fake",
+            sourceApplication: "Zoom",
+            startedAt: date.addingTimeInterval(-10),
+            endedAt: date,
+            stage: .pendingTranscription
+        )
+    }
 }

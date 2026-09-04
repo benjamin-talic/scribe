@@ -13,13 +13,22 @@ final class AppState {
     var pendingTranscriptions = 0
     var storageError: String?
     var meetingDetectionError: String?
+    var recordingError: String?
     var activeMeetingApplications: Set<MeetingApplication> = []
     var requestedRecordingApplication: MeetingApplication?
     var requestedAutomaticStopApplication: MeetingApplication?
+    private var recordingApplication: MeetingApplication?
+    private var recordingStartInProgress = false
     private let sessionStore: SessionStore?
+    private let recorder: (any RecordingControlling)?
 
-    init(sessionStore: SessionStore? = nil, storageError: String? = nil) {
+    init(
+        sessionStore: SessionStore? = nil,
+        recorder: (any RecordingControlling)? = nil,
+        storageError: String? = nil
+    ) {
         self.sessionStore = sessionStore
+        self.recorder = recorder
         self.storageError = storageError
     }
 
@@ -60,5 +69,58 @@ final class AppState {
             activeMeetingApplications.remove(application)
             requestedAutomaticStopApplication = application
         }
+    }
+
+    func startRecording(for application: MeetingApplication? = nil, at date: Date = .now) async {
+        guard let recorder, !isRecording, !recordingStartInProgress else { return }
+        recordingStartInProgress = true
+        defer { recordingStartInProgress = false }
+
+        do {
+            let session = try await recorder.start(for: application, at: date)
+            recordingState = .recording(startedAt: session.startedAt)
+            recordingApplication = application
+            requestedRecordingApplication = nil
+            requestedAutomaticStopApplication = nil
+            recordingError = nil
+        } catch {
+            recordingError = error.localizedDescription
+        }
+    }
+
+    func stopRecording(at date: Date = .now) async {
+        guard let recorder, isRecording else { return }
+
+        do {
+            _ = try await recorder.stop(at: date)
+            recordingState = .idle
+            recordingApplication = nil
+            pendingTranscriptions = try await sessionStore?.pendingTranscriptionCount() ?? 0
+            recordingError = nil
+        } catch {
+            recordingState = .idle
+            recordingApplication = nil
+            recordingError = error.localizedDescription
+            await restoreSessions(at: date)
+        }
+    }
+
+    func stopRecording(ifMeetingEnded application: MeetingApplication, at date: Date = .now) async {
+        guard Self.shouldAutomaticallyStop(
+            recordingApplication: recordingApplication,
+            endedApplication: application
+        ) else { return }
+        await stopRecording(at: date)
+    }
+
+    var manualRecordingApplication: MeetingApplication? {
+        activeMeetingApplications.count == 1 ? activeMeetingApplications.first : nil
+    }
+
+    static func shouldAutomaticallyStop(
+        recordingApplication: MeetingApplication?,
+        endedApplication: MeetingApplication
+    ) -> Bool {
+        recordingApplication == endedApplication
     }
 }
