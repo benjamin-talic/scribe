@@ -12,6 +12,10 @@ final class AppState {
     var recordingState: RecordingState = .idle
     var pendingTranscriptions = 0
     var storageError: String?
+    var meetingDetectionError: String?
+    var activeMeetingApplications: Set<MeetingApplication> = []
+    var requestedRecordingApplication: MeetingApplication?
+    var requestedAutomaticStopApplication: MeetingApplication?
     private let sessionStore: SessionStore?
 
     init(sessionStore: SessionStore? = nil, storageError: String? = nil) {
@@ -44,6 +48,17 @@ final class AppState {
             storageError = warnings.isEmpty ? nil : warnings.joined(separator: "\n")
         } catch {
             storageError = error.localizedDescription
+        }
+    }
+
+    func handleMeetingEvent(_ event: MeetingEvent) {
+        meetingDetectionError = nil
+        switch event {
+        case let .started(application):
+            activeMeetingApplications.insert(application)
+        case let .ended(application):
+            activeMeetingApplications.remove(application)
+            requestedAutomaticStopApplication = application
         }
     }
 }

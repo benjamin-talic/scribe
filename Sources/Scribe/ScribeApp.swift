@@ -4,6 +4,8 @@ import SwiftUI
 @main
 struct ScribeApp: App {
     @State private var state: AppState
+    private let meetingDetector: MeetingDetector
+    private let meetingNotifications: MeetingNotifications
 
     init() {
         let state: AppState
@@ -13,7 +15,34 @@ struct ScribeApp: App {
             state = AppState(storageError: error.localizedDescription)
         }
         _state = State(initialValue: state)
-        Task { await state.restoreSessions() }
+
+        let detector = MeetingDetector()
+        let notifications = MeetingNotifications()
+        meetingDetector = detector
+        meetingNotifications = notifications
+        notifications.onStart = { [weak state] application in
+            state?.requestedRecordingApplication = application
+        }
+        notifications.configure()
+        detector.onEvent = { [weak state, weak notifications] event in
+            guard let notifications else { return }
+            state?.handleMeetingEvent(event)
+            switch event {
+            case let .started(application): notifications.offerRecording(for: application)
+            case let .ended(application): notifications.clearOffer(for: application)
+            }
+        }
+        detector.onError = { [weak state] error in
+            state?.meetingDetectionError = error
+        }
+
+        Task {
+            await state.restoreSessions()
+            if !(await notifications.requestAuthorization()) {
+                state.meetingDetectionError = "Notifications are disabled, so meeting prompts cannot be shown."
+            }
+            detector.start()
+        }
     }
 
     var body: some Scene {
@@ -74,8 +103,18 @@ private struct MenuView: View {
                 .foregroundStyle(.secondary)
             }
 
+            if let application = state.activeMeetingApplications.first {
+                Label("Meeting detected in \(application.name)", systemImage: "mic")
+                    .foregroundStyle(.secondary)
+            }
+
             if let storageError = state.storageError {
                 Label(storageError, systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(.red)
+            }
+
+            if let meetingDetectionError = state.meetingDetectionError {
+                Label(meetingDetectionError, systemImage: "mic.slash")
                     .foregroundStyle(.red)
             }
 

@@ -45,4 +45,16 @@ struct AppStateTests {
         #expect(state.pendingTranscriptions == 1)
         #expect(state.storageError?.contains("broken") == true)
     }
+
+    @Test
+    func endedMeetingRequestsAutomaticStop() {
+        let state = AppState()
+        let zoom = MeetingApplication(bundleID: "us.zoom.xos", name: "Zoom")
+
+        state.handleMeetingEvent(.started(zoom))
+        state.handleMeetingEvent(.ended(zoom))
+
+        #expect(state.activeMeetingApplications.isEmpty)
+        #expect(state.requestedAutomaticStopApplication == zoom)
+    }
 }
