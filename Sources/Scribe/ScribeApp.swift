@@ -166,20 +166,41 @@ private struct MenuView: View {
 }
 
 private struct LibraryView: View {
+    private enum Section: String, CaseIterable, Identifiable {
+        case inbox
+        case places
+        case settings
+
+        var id: Self { self }
+
+        var title: String {
+            switch self {
+            case .inbox: "Inbox"
+            case .places: "Places"
+            case .settings: "Settings"
+            }
+        }
+
+        var icon: String {
+            switch self {
+            case .inbox: "tray"
+            case .places: "folder"
+            case .settings: "gearshape"
+            }
+        }
+    }
+
+    @State private var selection: Section? = .inbox
+
     var body: some View {
         NavigationSplitView {
-            List {
-                Label("Inbox", systemImage: "tray")
-                Label("Places", systemImage: "folder")
-                Label("Settings", systemImage: "gearshape")
+            List(Section.allCases, selection: $selection) { section in
+                Label(section.title, systemImage: section.icon)
+                    .tag(section)
             }
             .navigationTitle("Scribe")
         } detail: {
-            ContentUnavailableView(
-                "No meetings yet",
-                systemImage: "waveform",
-                description: Text("Completed meeting notes will appear here.")
-            )
+            detail
         }
         .onAppear {
             NSApp.setActivationPolicy(.regular)
@@ -187,6 +208,32 @@ private struct LibraryView: View {
         }
         .onDisappear {
             NSApp.setActivationPolicy(.accessory)
+        }
+    }
+
+    @ViewBuilder
+    private var detail: some View {
+        switch selection ?? .inbox {
+        case .inbox:
+            ContentUnavailableView(
+                "No meetings yet",
+                systemImage: "waveform",
+                description: Text("Completed meeting notes will appear here.")
+            )
+        case .places:
+            ContentUnavailableView(
+                "No places configured",
+                systemImage: "folder",
+                description: Text("Folder management will be added with the library.")
+            )
+        case .settings:
+            Form {
+                LabeledContent("Meeting apps", value: "Zoom, Arc")
+                LabeledContent("Transcription", value: "Whisper small")
+                LabeledContent("Speaker labels", value: "SpeakerKit")
+            }
+            .formStyle(.grouped)
+            .navigationTitle("Settings")
         }
     }
 }
