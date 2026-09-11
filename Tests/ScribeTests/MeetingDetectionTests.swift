@@ -38,7 +38,10 @@ struct MeetingDetectionTests {
 
         observed = []
         detector.refresh()
-        try? await Task.sleep(for: .milliseconds(30))
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while events.count < 2 && ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
         #expect(events == [.started(zoom), .ended(zoom)])
     }
 

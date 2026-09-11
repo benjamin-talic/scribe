@@ -60,6 +60,31 @@ struct AppStateTests {
     }
 
     @Test
+    func duplicateDeleteClicksDoNotReportAFailure() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: "scribe-delete-tests-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try SessionStore(rootURL: root)
+        let url = root.appending(path: "inbox/\(UUID()).md")
+        try Data("---\nscribe_id: old\n---\n# Old note\n".utf8).write(to: url)
+        let trashURL = try FileManager.default.url(
+            for: .trashDirectory, in: .userDomainMask, appropriateFor: url, create: false
+        ).appending(path: url.lastPathComponent)
+        defer { try? FileManager.default.removeItem(at: trashURL) }
+        let state = AppState(sessionStore: store)
+        await state.loadLibrary()
+        let note = try #require(state.notes.first)
+
+        async let first: Void = state.trashNote(note)
+        async let second: Void = state.trashNote(note)
+        _ = await (first, second)
+        await state.trashNote(note)
+
+        #expect(state.notes.isEmpty)
+        #expect(state.storageError == nil)
+        #expect(FileManager.default.fileExists(atPath: trashURL.path))
+    }
+
+    @Test
     func automaticStopOnlyMatchesTheRecordedApplication() {
         let zoom = MeetingApplication(bundleID: "us.zoom.xos", name: "Zoom")
         let arc = MeetingApplication(bundleID: "company.thebrowser.Browser", name: "Arc")
@@ -73,11 +98,16 @@ struct AppStateTests {
     func appStateCoordinatesRecordingLifecycle() async {
         let recorder = FakeRecorder()
         let state = AppState(recorder: recorder)
+        var recordingStartedCount = 0
+        state.onRecordingStarted = { recordingStartedCount += 1 }
         let zoom = MeetingApplication(bundleID: "us.zoom.xos", name: "Zoom")
         let start = Date(timeIntervalSince1970: 100)
 
         await state.startRecording(for: zoom, at: start)
         #expect(state.recordingState == .recording(startedAt: start))
+        #expect(recordingStartedCount == 1)
+        await state.startRecording(for: zoom, at: start)
+        #expect(recordingStartedCount == 1)
 
         await state.stopRecording(ifMeetingEnded: zoom, at: start.addingTimeInterval(10))
         #expect(state.recordingState == .idle)

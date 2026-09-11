@@ -2,6 +2,7 @@ import Darwin
 import Foundation
 
 enum NotesClient: String, CaseIterable, Codable, Identifiable, Sendable {
+    case claude
     case openCode
     case pi
 
@@ -9,8 +10,21 @@ enum NotesClient: String, CaseIterable, Codable, Identifiable, Sendable {
 
     var name: String {
         switch self {
+        case .claude: "Claude"
         case .openCode: "OpenCode"
         case .pi: "Pi"
+        }
+    }
+
+    var model: String {
+        self == .claude ? "sonnet" : "openai/gpt-5.6-terra"
+    }
+
+    var executableName: String {
+        switch self {
+        case .claude: "claude"
+        case .openCode: "opencode"
+        case .pi: "pi"
         }
     }
 }
@@ -43,21 +57,21 @@ struct CLINotesGenerator: SessionNotesGenerating, Sendable {
         }
     }
 
-    private static let model = "openai/gpt-5.6-terra"
     private static let prompt = """
         Create concise meeting notes from the attached transcript. Return only Markdown with a short descriptive H1 title followed by an H2 named Notes. Include a summary, key points, decisions, and action items when present. Do not repeat the transcript.
         """
 
     let client: NotesClient
+    var executable: URL?
 
     func generate(from transcript: URL) async throws -> String {
         try await Task.detached {
-            try Self.run(client: client, transcript: transcript)
+            try Self.run(client: client, transcript: transcript, executable: executable)
         }.value
     }
 
-    private static func run(client: NotesClient, transcript: URL) throws -> String {
-        let executable = try executableURL(for: client)
+    private static func run(client: NotesClient, transcript: URL, executable: URL?) throws -> String {
+        let executable = try executable ?? executableURL(for: client)
         let temporaryDirectory = FileManager.default.temporaryDirectory
             .appending(path: "scribe-notes-\(UUID().uuidString)", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: temporaryDirectory, withIntermediateDirectories: false)
@@ -77,17 +91,31 @@ struct CLINotesGenerator: SessionNotesGenerating, Sendable {
         let process = Process()
         process.executableURL = executable
         process.currentDirectoryURL = temporaryDirectory
-        process.standardInput = FileHandle.nullDevice
+        let input = client == .claude ? try FileHandle(forReadingFrom: transcript) : FileHandle.nullDevice
+        defer { if client == .claude { try? input.close() } }
+        process.standardInput = input
         process.standardOutput = output
         process.standardError = errors
         process.arguments = switch client {
+        case .claude:
+            [
+                "--print", "--safe-mode", "--no-session-persistence", "--tools", "",
+                "--strict-mcp-config", "--model", client.model, "--output-format", "text",
+                "--system-prompt", prompt,
+            ]
         case .openCode:
-            ["run", prompt, "--pure", "--agent", "scribe", "--model", model, "--file", transcript.path]
+            ["run", prompt, "--pure", "--agent", "scribe", "--model", client.model, "--file", transcript.path]
         case .pi:
             [
                 "--print", "--no-session", "--no-tools", "--no-extensions", "--no-skills",
-                "--no-context-files", "--no-approve", "--model", model, "@\(transcript.path)", prompt,
+                "--no-context-files", "--no-approve", "--model", client.model, "@\(transcript.path)", prompt,
             ]
+        }
+        if client == .claude {
+            var environment = ProcessInfo.processInfo.environment
+            environment["PWD"] = temporaryDirectory.path
+            environment.removeValue(forKey: "CLAUDECODE")
+            process.environment = environment
         }
         if client == .openCode {
             var environment = ProcessInfo.processInfo.environment
@@ -141,12 +169,14 @@ struct CLINotesGenerator: SessionNotesGenerating, Sendable {
     private static func executableURL(for client: NotesClient) throws -> URL {
         let home = FileManager.default.homeDirectoryForCurrentUser
         var candidates = switch client {
+        case .claude:
+            [home.appending(path: ".local/bin/claude")]
         case .openCode:
             [home.appending(path: ".opencode/bin/opencode")]
         case .pi:
             [home.appending(path: ".local/bin/pi")]
         }
-        let executableName = client == .openCode ? "opencode" : "pi"
+        let executableName = client.executableName
         candidates += ["/opt/homebrew/bin", "/usr/local/bin"].map {
             URL(filePath: $0).appending(path: executableName)
         }

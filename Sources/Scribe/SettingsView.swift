@@ -2,15 +2,15 @@ import AppKit
 import AVFoundation
 import ServiceManagement
 import SwiftUI
-import UserNotifications
+import UniformTypeIdentifiers
 
 struct SettingsView: View {
     @Environment(AppState.self) private var state
     @State private var microphones: [AudioInputDevice] = []
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
     @State private var microphonePermission = AVCaptureDevice.authorizationStatus(for: .audio)
-    @State private var notificationPermission: UNAuthorizationStatus = .notDetermined
     @AppStorage(microphoneDeviceUIDKey) private var microphoneDeviceUID = ""
+    @AppStorage(notesApplicationPathKey) private var notesApplicationPath = ""
     @AppStorage(systemAudioPermissionGrantedKey) private var systemAudioPermissionGranted = false
 
     var body: some View {
@@ -21,6 +21,17 @@ struct SettingsView: View {
                     isOn: Binding(get: { launchAtLogin }, set: { enabled in setLaunchAtLogin(enabled) })
                 )
                 LabeledContent("Meeting apps", value: "Zoom, Arc")
+                LabeledContent("Open notes with") {
+                    HStack {
+                        Text(notesApplicationPath.isEmpty ? "System default" :
+                            FileManager.default.displayName(atPath: notesApplicationPath))
+                        Button("Choose App…") { chooseNotesApplication() }
+                        if !notesApplicationPath.isEmpty {
+                            Button("Reset") { notesApplicationPath = "" }
+                                .help("Use the system default app for Markdown files")
+                        }
+                    }
+                }
                 Picker("Microphone", selection: $microphoneDeviceUID) {
                     Text(systemDefaultMicrophoneLabel).tag("")
                     if !microphoneDeviceUID.isEmpty,
@@ -44,15 +55,6 @@ struct SettingsView: View {
                 ) {
                     openPrivacySettings("Privacy_ScreenCapture")
                 }
-                permissionRow(
-                    "Notifications",
-                    status: notificationPermissionText,
-                    granted: notificationPermission == .authorized
-                ) {
-                    if let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension") {
-                        NSWorkspace.shared.open(url)
-                    }
-                }
             }
 
             Section("Processing") {
@@ -69,7 +71,7 @@ struct SettingsView: View {
                         Text(client.name).tag(client)
                     }
                 }
-                LabeledContent("Notes model", value: "openai/gpt-5.6-terra")
+                LabeledContent("Notes model", value: state.notesClient == .claude ? "Claude Sonnet" : state.notesClient.model)
             }
         }
         .formStyle(.grouped)
@@ -116,10 +118,19 @@ struct SettingsView: View {
         }
     }
 
+    private func chooseNotesApplication() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.application]
+        panel.directoryURL = URL(filePath: "/Applications", directoryHint: .isDirectory)
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Choose App"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        notesApplicationPath = url.path
+    }
+
     private func refresh() async {
         microphones = AudioInputDevice.available()
         microphonePermission = AVCaptureDevice.authorizationStatus(for: .audio)
-        notificationPermission = await UNUserNotificationCenter.current().notificationSettings().authorizationStatus
         launchAtLogin = SMAppService.mainApp.status == .enabled
     }
 
@@ -134,15 +145,6 @@ struct SettingsView: View {
         case .denied: "Denied"
         case .restricted: "Restricted"
         case .notDetermined: "Requested when first recording"
-        @unknown default: "Unknown"
-        }
-    }
-
-    private var notificationPermissionText: String {
-        switch notificationPermission {
-        case .authorized, .provisional, .ephemeral: "Granted"
-        case .denied: "Denied"
-        case .notDetermined: "Requested at launch"
         @unknown default: "Unknown"
         }
     }

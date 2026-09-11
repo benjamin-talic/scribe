@@ -65,7 +65,7 @@ struct LibrarySnapshot: Sendable {
 }
 
 private struct ScribeSettings: Codable {
-    var notesClient: NotesClient = .openCode
+    var notesClient: NotesClient = .claude
     var places: [Place] = []
 }
 
@@ -330,11 +330,7 @@ actor SessionStore {
 
     func moveNote(_ note: MeetingNote, to placeID: UUID?) throws {
         let settings = try loadSettings()
-        let managedDirectories = [inboxDirectory] + settings.places.map(\.directory)
-        let sourceDirectory = note.url.deletingLastPathComponent().standardizedFileURL.resolvingSymlinksInPath()
-        guard managedDirectories.contains(where: {
-            $0.standardizedFileURL.resolvingSymlinksInPath() == sourceDirectory
-        }) else { throw Error.unmanagedNote }
+        try validateNote(note, settings: settings)
 
         let place = try placeID.map { id in
             guard let place = settings.places.first(where: { $0.id == id }) else { throw Error.placeNotFound }
@@ -346,10 +342,6 @@ actor SessionStore {
               isDirectory.boolValue, fileManager.isWritableFile(atPath: destinationDirectory.path) else {
             throw Error.invalidPlaceDirectory
         }
-        let values = try note.url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
-        let markdown = try String(contentsOf: note.url, encoding: .utf8)
-        guard values.isRegularFile == true, values.isSymbolicLink != true,
-              frontmatterValue("scribe_id", in: markdown) == note.scribeID else { throw Error.unmanagedNote }
         let destination = availableURL(in: destinationDirectory, filename: note.url.lastPathComponent)
         var moved = false
         do {
@@ -364,6 +356,43 @@ actor SessionStore {
             if moved { try? fileManager.moveItem(at: destination, to: note.url) }
             throw error
         }
+    }
+
+    @discardableResult
+    func trashNote(_ note: MeetingNote) throws -> [URL] {
+        try validateNote(note, settings: loadSettings())
+        var sessionDirectory: URL?
+        if let session = try? load(note.scribeID) {
+            guard session.stage == .complete else {
+                throw Error.invalidTransition(from: session.stage, to: .complete)
+            }
+            if session.finalNotePath.map({ URL(filePath: $0).standardizedFileURL }) == note.url.standardizedFileURL {
+                sessionDirectory = paths(for: session.id).directory
+            }
+        }
+
+        var trashedNote: NSURL?
+        try fileManager.trashItem(at: note.url, resultingItemURL: &trashedNote)
+        var trashedItems = trashedNote.map { [$0 as URL] } ?? []
+        if let sessionDirectory {
+            do {
+                var trashedSession: NSURL?
+                try fileManager.trashItem(at: sessionDirectory, resultingItemURL: &trashedSession)
+                if let trashedSession { trashedItems.append(trashedSession as URL) }
+            } catch {
+                if let trashedNote { try fileManager.moveItem(at: trashedNote as URL, to: note.url) }
+                throw error
+            }
+        }
+        return trashedItems
+    }
+
+    private func validateNote(_ note: MeetingNote, settings: ScribeSettings) throws {
+        let managedDirectories = [inboxDirectory] + settings.places.map(\.directory)
+        let sourceDirectory = note.url.deletingLastPathComponent().standardizedFileURL.resolvingSymlinksInPath()
+        guard managedDirectories.contains(where: {
+            $0.standardizedFileURL.resolvingSymlinksInPath() == sourceDirectory
+        }), isOwnedNote(note.url, sessionID: note.scribeID) else { throw Error.unmanagedNote }
     }
 
     @discardableResult
@@ -602,8 +631,9 @@ actor SessionStore {
     }
 
     private func isOwnedNote(_ url: URL, sessionID: String) -> Bool {
-        guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
-              values.isRegularFile == true, values.isSymbolicLink != true,
+        // URL resource values can be cached across a file replacement; recheck the actual directory entry.
+        var info = stat()
+        guard lstat(url.path, &info) == 0, info.st_mode & S_IFMT == S_IFREG,
               let markdown = try? String(contentsOf: url, encoding: .utf8) else { return false }
         return frontmatterValue("scribe_id", in: markdown) == sessionID
     }

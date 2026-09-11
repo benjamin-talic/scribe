@@ -14,7 +14,7 @@ codesign \
     --force \
     --options runtime \
     --entitlements "$root/Resources/Scribe.entitlements" \
-    --sign "${CODE_SIGN_IDENTITY:--}" \
+    --sign "${CODE_SIGN_IDENTITY:?Set CODE_SIGN_IDENTITY to a codesigning identity, or - for ad-hoc}" \
     "$app"
 
 "$root/scripts/smoke-test-app.sh" "$app"

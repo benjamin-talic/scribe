@@ -1,5 +1,7 @@
-import Foundation
+import AppKit
 import Observation
+
+let notesApplicationPathKey = "notesApplicationPath"
 
 @MainActor
 @Observable
@@ -14,7 +16,7 @@ final class AppState {
     var storageError: String?
     var meetingDetectionError: String?
     var recordingError: String?
-    var notesClient: NotesClient = .openCode
+    var notesClient: NotesClient = .claude
     var places: [Place] = []
     var notes: [MeetingNote] = []
     var transcriptionFailures: [RecordingSession] = []
@@ -22,9 +24,11 @@ final class AppState {
     var activeMeetingApplications: Set<MeetingApplication> = []
     var requestedRecordingApplication: MeetingApplication?
     var requestedAutomaticStopApplication: MeetingApplication?
+    var onRecordingStarted: (() -> Void)?
     private var recordingApplication: MeetingApplication?
     private var recordingStartInProgress = false
     private var recordingStopInProgress = false
+    private var deletingNoteIDs: Set<URL> = []
     private let sessionStore: SessionStore?
     private let recorder: (any RecordingControlling)?
     private let processingQueue: ProcessingQueue?
@@ -106,6 +110,7 @@ final class AppState {
         do {
             let session = try await recorder.start(for: application, at: date)
             recordingState = .recording(startedAt: session.startedAt)
+            onRecordingStarted?()
             recordingApplication = application
             requestedRecordingApplication = nil
             requestedAutomaticStopApplication = nil
@@ -215,6 +220,38 @@ final class AppState {
             await loadLibrary()
         } catch {
             storageError = error.localizedDescription
+        }
+    }
+
+    func trashNote(_ note: MeetingNote) async {
+        guard let sessionStore, notes.contains(where: { $0.id == note.id }),
+              deletingNoteIDs.insert(note.id).inserted else { return }
+        defer { deletingNoteIDs.remove(note.id) }
+        do {
+            try await sessionStore.trashNote(note)
+            storageError = nil
+            await loadLibrary()
+        } catch {
+            storageError = error.localizedDescription
+        }
+    }
+
+    func openNote(_ note: MeetingNote) async {
+        let applicationPath = UserDefaults.standard.string(forKey: notesApplicationPathKey) ?? ""
+        if applicationPath.isEmpty {
+            if !NSWorkspace.shared.open(note.url) {
+                storageError = "Could not open \(note.url.lastPathComponent). Choose an app in Settings."
+            }
+        } else {
+            do {
+                try await NSWorkspace.shared.open(
+                    [note.url],
+                    withApplicationAt: URL(filePath: applicationPath),
+                    configuration: NSWorkspace.OpenConfiguration()
+                )
+            } catch {
+                storageError = "Could not open the note with your selected app: \(error.localizedDescription)"
+            }
         }
     }
 

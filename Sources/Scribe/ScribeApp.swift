@@ -25,7 +25,9 @@ struct ScribeApp: App {
         let notifications = MeetingNotifications()
         meetingDetector = detector
         meetingNotifications = notifications
+        state.onRecordingStarted = { [weak notifications] in notifications?.clearOffers() }
         notifications.onStart = { [weak state] application in
+            guard state?.activeMeetingApplications.contains(application) == true else { return }
             state?.requestedRecordingApplication = application
             await state?.startRecording(for: application)
         }
@@ -34,7 +36,8 @@ struct ScribeApp: App {
             guard let notifications else { return }
             state?.handleMeetingEvent(event)
             switch event {
-            case let .started(application): notifications.offerRecording(for: application)
+            case let .started(application):
+                if state?.isRecording == false { notifications.offerRecording(for: application) }
             case let .ended(application):
                 notifications.clearOffer(for: application)
                 Task { await state?.stopRecording(ifMeetingEnded: application) }
@@ -46,9 +49,6 @@ struct ScribeApp: App {
 
         Task {
             await state.restoreSessions()
-            if !(await notifications.requestAuthorization()) {
-                state.meetingDetectionError = "Notifications are disabled, so meeting prompts cannot be shown."
-            }
             detector.start()
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(3_600))
@@ -391,7 +391,7 @@ private struct LibraryView: View {
             ForEach(notes) { note in
                 HStack {
                     Button {
-                        NSWorkspace.shared.open(note.url)
+                        Task { await state.openNote(note) }
                     } label: {
                         VStack(alignment: .leading) {
                             Text(note.title)
@@ -415,6 +415,14 @@ private struct LibraryView: View {
                         }
                         .menuStyle(.borderlessButton)
                     }
+                    Button(role: .destructive) {
+                        Task { await state.trashNote(note) }
+                    } label: {
+                        Label("Delete note", systemImage: "trash")
+                    }
+                    .labelStyle(.iconOnly)
+                    .buttonStyle(.borderless)
+                    .help("Move note and saved recording data to Trash")
                 }
             }
         }

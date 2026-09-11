@@ -1,75 +1,120 @@
-import Foundation
+import AppKit
+import SwiftUI
 import UserNotifications
 
 @MainActor
-final class MeetingNotifications: NSObject, UNUserNotificationCenterDelegate {
-    private static let category = "meeting-detected"
-    private nonisolated static let startAction = "start-recording"
-    private nonisolated static let closeAction = "close-notification"
-    private let center = UNUserNotificationCenter.current()
-    private var isAuthorized = false
+final class MeetingNotifications {
+    private var panels: [MeetingApplication: NSPanel] = [:]
 
     var onStart: ((MeetingApplication) async -> Void)?
 
     func configure() {
-        center.delegate = self
-        center.setNotificationCategories([
-            UNNotificationCategory(
-                identifier: Self.category,
-                actions: [
-                    UNNotificationAction(identifier: Self.startAction, title: "Start Recording"),
-                    UNNotificationAction(identifier: Self.closeAction, title: "Close"),
-                ],
-                intentIdentifiers: []
-            ),
-        ])
-    }
-
-    func requestAuthorization() async -> Bool {
-        isAuthorized = (try? await center.requestAuthorization(options: [.alert, .sound])) == true
-        return isAuthorized
+        // Remove banners left over from the system-notification implementation.
+        UNUserNotificationCenter.current().removeAllDeliveredNotifications()
+        UNUserNotificationCenter.current().removeAllPendingNotificationRequests()
     }
 
     func offerRecording(for application: MeetingApplication) {
-        guard isAuthorized else { return }
-        let content = UNMutableNotificationContent()
-        content.title = "Meeting detected in \(application.name)"
-        content.body = "Should Scribe start recording?"
-        content.categoryIdentifier = Self.category
-        content.userInfo = ["bundleID": application.bundleID, "name": application.name]
-        center.add(UNNotificationRequest(identifier: identifier(for: application), content: content, trigger: nil))
+        guard panels[application] == nil else { return }
+        let panel = MeetingToastPanel(
+            contentRect: .zero,
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.level = .floating
+        panel.title = "Scribe — Meeting detected in \(application.name)"
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.hidesOnDeactivate = false
+        panel.becomesKeyOnlyIfNeeded = true
+        panel.isReleasedWhenClosed = false
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        let view = NSHostingView(rootView: MeetingToast(
+            application: application,
+            start: { [weak self] in
+                self?.clearOffers()
+                Task { await self?.onStart?(application) }
+            },
+            dismiss: { [weak self] in self?.clearOffer(for: application) }
+        ))
+        panel.contentView = view
+        panel.setContentSize(view.fittingSize)
+        panels[application] = panel
+        positionOffers()
+        panel.orderFrontRegardless()
     }
 
     func clearOffer(for application: MeetingApplication) {
-        center.removeDeliveredNotifications(withIdentifiers: [identifier(for: application)])
+        panels.removeValue(forKey: application)?.close()
+        positionOffers()
     }
 
-    nonisolated func userNotificationCenter(
-        _: UNUserNotificationCenter,
-        willPresent _: UNNotification,
-        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
-    ) {
-        completionHandler([.banner, .sound])
+    func clearOffers() {
+        panels.values.forEach { $0.close() }
+        panels.removeAll()
     }
 
-    nonisolated func userNotificationCenter(
-        _: UNUserNotificationCenter,
-        didReceive response: UNNotificationResponse
-    ) async {
-        let action = response.actionIdentifier
-        let identifier = response.notification.request.identifier
-        let bundleID = response.notification.request.content.userInfo["bundleID"] as? String
-        let name = response.notification.request.content.userInfo["name"] as? String
-        await handle(action: action, identifier: identifier, bundleID: bundleID, name: name)
+    private func positionOffers() {
+        guard let screen = NSScreen.screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) }) ?? NSScreen.main else {
+            return
+        }
+        var top = screen.visibleFrame.maxY - 16
+        for application in panels.keys.sorted(by: { $0.bundleID < $1.bundleID }) {
+            guard let panel = panels[application] else { continue }
+            panel.setFrameTopLeftPoint(NSPoint(x: screen.visibleFrame.maxX - panel.frame.width - 16, y: top))
+            top -= panel.frame.height + 12
+        }
     }
+}
 
-    private func handle(action: String, identifier: String, bundleID: String?, name: String?) async {
-        center.removeDeliveredNotifications(withIdentifiers: [identifier])
-        guard action == Self.startAction, let bundleID, let name else { return }
-        await onStart?(MeetingApplication(bundleID: bundleID, name: name))
-    }
+private final class MeetingToastPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+}
 
-    private func identifier(for application: MeetingApplication) -> String {
-        "meeting-\(application.bundleID)"
+struct MeetingToast: View {
+    let application: MeetingApplication
+    let start: () -> Void
+    let dismiss: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(nsImage: NSApp.applicationIconImage)
+                    .resizable()
+                    .frame(width: 36, height: 36)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Meeting detected")
+                        .font(.headline)
+                    Text("Ready to take notes in \(application.name)?")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
+                Button(action: dismiss) {
+                    Label("Dismiss", systemImage: "xmark")
+                }
+                .labelStyle(.iconOnly)
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .help("Dismiss recording prompt")
+            }
+            Button(action: start) {
+                Label("Start recording", systemImage: "record.circle")
+                    .font(.headline)
+                    .frame(maxWidth: .infinity, minHeight: 32)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.blue)
+            .environment(\.controlActiveState, .active)
+            .controlSize(.large)
+            .buttonBorderShape(.roundedRectangle(radius: 10))
+        }
+        .padding(16)
+        .frame(width: 360)
+        .background(.regularMaterial, in: .rect(cornerRadius: 18))
+        .overlay(RoundedRectangle(cornerRadius: 18).stroke(.quaternary, lineWidth: 1))
     }
 }

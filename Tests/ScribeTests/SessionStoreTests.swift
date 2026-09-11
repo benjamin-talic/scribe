@@ -271,6 +271,105 @@ struct SessionStoreTests {
         #expect(FileManager.default.fileExists(atPath: recentPaths.othersAudio.path))
     }
 
+    @Test(arguments: [false, true])
+    func trashRemovesNoteAndSessionWithoutRegenerating(inPlace: Bool) async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try SessionStore(rootURL: root)
+        try await store.createSession(sourceApplication: "Zoom", id: "delete-me")
+        for stage in [RecordingSession.Stage.pendingTranscription, .transcribing, .transcribed, .generatingNotes] {
+            try await store.transition("delete-me", to: stage)
+        }
+        try await store.writeNotes("delete-me", generated: "# Disposable\n\n## Notes\n\nSummary.", transcript: "Hello")
+        let paths = try await store.sessionPaths(for: "delete-me")
+        try Data("audio".utf8).write(to: paths.meAudio)
+        var note = try #require(try await store.librarySnapshot().notes.first)
+        if inPlace {
+            let directory = root.appending(path: "place", directoryHint: .isDirectory)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let place = try await store.addPlace(name: "Team", directory: directory)
+            try await store.moveNote(note, to: place.id)
+            note = try #require(try await store.librarySnapshot().notes.first)
+        }
+
+        let trashed = try await store.trashNote(note)
+        defer { for url in trashed { try? FileManager.default.removeItem(at: url) } }
+        #expect(trashed.count == 2)
+        #expect(trashed.allSatisfy { FileManager.default.fileExists(atPath: $0.path) })
+        #expect(!FileManager.default.fileExists(atPath: note.url.path))
+        #expect(!FileManager.default.fileExists(atPath: paths.directory.path))
+        let reloaded = try SessionStore(rootURL: root)
+        #expect(try await reloaded.recoverInterruptedWork().isEmpty)
+        #expect(try await reloaded.allSessions().isEmpty)
+        #expect(try await reloaded.librarySnapshot().notes.isEmpty)
+    }
+
+    @Test
+    func trashWorksAfterRetentionAndRejectsReplacedNotes() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try SessionStore(rootURL: root)
+        let url = root.appending(path: "inbox/old.md")
+        let markdown = "---\nscribe_id: old\n---\n# Old note\n"
+        try Data(markdown.utf8).write(to: url)
+        let note = try #require(try await store.librarySnapshot().notes.first)
+
+        try Data("unrelated file".utf8).write(to: url)
+        await #expect(throws: SessionStore.Error.self) { try await store.trashNote(note) }
+        #expect(try String(contentsOf: url, encoding: .utf8) == "unrelated file")
+
+        try Data(markdown.utf8).write(to: url)
+        let outside = root.appending(path: "outside.md")
+        try FileManager.default.moveItem(at: url, to: outside)
+        try FileManager.default.createSymbolicLink(at: url, withDestinationURL: outside)
+        await #expect(throws: SessionStore.Error.self) { try await store.trashNote(note) }
+        let unmanaged = MeetingNote(url: outside, scribeID: note.scribeID, title: note.title, date: note.date, placeID: nil)
+        await #expect(throws: SessionStore.Error.self) { try await store.trashNote(unmanaged) }
+        #expect(FileManager.default.fileExists(atPath: outside.path))
+
+        try FileManager.default.removeItem(at: url)
+        try FileManager.default.moveItem(at: outside, to: url)
+        let trashed = try await store.trashNote(note)
+        defer { for url in trashed { try? FileManager.default.removeItem(at: url) } }
+        #expect(trashed.count == 1)
+        #expect(try await store.librarySnapshot().notes.isEmpty)
+    }
+
+    @Test
+    func notesClientDefaultsToClaudeAndPreservesSavedChoice() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try SessionStore(rootURL: root)
+        #expect(try await store.notesClient() == .claude)
+        try Data(#"{"notesClient":"openCode","places":[]}"#.utf8).write(to: root.appending(path: "settings.json"))
+        #expect(try await SessionStore(rootURL: root).notesClient() == .openCode)
+        try await store.setNotesClient(.pi)
+        #expect(try await SessionStore(rootURL: root).notesClient() == .pi)
+        try await store.setNotesClient(.claude)
+        #expect(try await SessionStore(rootURL: root).notesClient() == .claude)
+    }
+
+    @Test(arguments: [nil, "invalid metadata"] as [String?])
+    func trashWorksWithUnreadableSessionMetadata(metadata: String?) async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try SessionStore(rootURL: root)
+        let directory = root.appending(path: "sessions/orphan")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        if let metadata {
+            try Data(metadata.utf8).write(to: directory.appending(path: "meta.json"))
+        }
+        try Data("remaining audio".utf8).write(to: directory.appending(path: "me.caf"))
+        try Data("---\nscribe_id: orphan\n---\n# Old note\n".utf8).write(to: root.appending(path: "inbox/orphan.md"))
+        let note = try #require(try await store.librarySnapshot().notes.first)
+
+        let trashed = try await store.trashNote(note)
+        defer { for url in trashed { try? FileManager.default.removeItem(at: url) } }
+        #expect(trashed.count == 1)
+        #expect(try await store.librarySnapshot().notes.isEmpty)
+        #expect(FileManager.default.fileExists(atPath: directory.appending(path: "me.caf").path))
+    }
+
     private func temporaryDirectory() -> URL {
         FileManager.default.temporaryDirectory
             .appending(path: "scribe-tests-\(UUID().uuidString)", directoryHint: .isDirectory)

@@ -3,7 +3,7 @@ set -euo pipefail
 
 root=${0:A:h:h}
 
-if [[ -z ${CODE_SIGN_IDENTITY:-} || "$CODE_SIGN_IDENTITY" == "-" ]]; then
+if [[ ${CODE_SIGN_IDENTITY:-} == "-" ]]; then
     print -u2 "Set CODE_SIGN_IDENTITY to a stable Apple Development or Developer ID identity."
     exit 1
 fi
