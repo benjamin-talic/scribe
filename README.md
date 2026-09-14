@@ -45,6 +45,16 @@ Set `CODE_SIGN_IDENTITY` to one of them. Use `CODE_SIGN_IDENTITY=- ./scripts/bui
 
 On first use, grant microphone and system audio recording permissions when macOS requests them. Permission status and Launch at Login are available in Scribe's Settings view. Meeting toasts do not require notification permission.
 
+## Release
+
+```sh
+xcrun notarytool store-credentials scribe --apple-id you@example.com --team-id TEAMID  # once
+./scripts/release.sh
+gh release create vX.Y.Z .build/Scribe.zip
+```
+
+`release.sh` builds with the Developer ID identity, notarizes, staples the ticket and writes `.build/Scribe.zip`. Set `CODE_SIGN_IDENTITY` to use a different Developer ID.
+
 ## Data
 
 Scribe stores its working data under `~/Library/Application Support/Scribe/`:

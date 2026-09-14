@@ -13,6 +13,7 @@ cp "$root/Resources/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
 codesign \
     --force \
     --options runtime \
+    --timestamp \
     --entitlements "$root/Resources/Scribe.entitlements" \
     --sign "${CODE_SIGN_IDENTITY:?Set CODE_SIGN_IDENTITY to a codesigning identity, or - for ad-hoc}" \
     "$app"
