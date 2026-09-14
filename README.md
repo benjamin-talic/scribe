@@ -41,7 +41,7 @@ Find available signing identities with:
 security find-identity -v -p codesigning
 ```
 
-Set `CODE_SIGN_IDENTITY` to one of them. Use `CODE_SIGN_IDENTITY=- ./scripts/build-app.sh` for an ad-hoc development build; `install.sh` requires a stable signing identity.
+Set `CODE_SIGN_IDENTITY` to one of them, or put `CODE_SIGN_IDENTITY="..."` in a gitignored `.env` at the repo root. Use `CODE_SIGN_IDENTITY=- ./scripts/build-app.sh` for an ad-hoc development build; `install.sh` requires a stable signing identity.
 
 On first use, grant microphone and system audio recording permissions when macOS requests them. Permission status and Launch at Login are available in Scribe's Settings view. Meeting toasts do not require notification permission.
 

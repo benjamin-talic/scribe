@@ -2,6 +2,7 @@
 set -euo pipefail
 
 root=${0:A:h:h}
+[[ -f "$root/.env" ]] && source "$root/.env"
 swift build --package-path "$root" -c release
 
 app="$root/.build/Scribe.app"

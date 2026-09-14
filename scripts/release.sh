@@ -4,6 +4,7 @@
 set -euo pipefail
 
 root=${0:A:h:h}
+[[ -f "$root/.env" ]] && source "$root/.env"
 profile=${1:-scribe}
 app="$root/.build/Scribe.app"
 zip="$root/.build/Scribe.zip"
