@@ -53,7 +53,7 @@ xcrun notarytool store-credentials scribe --apple-id you@example.com --team-id T
 gh release create vX.Y.Z .build/Scribe.zip
 ```
 
-`release.sh` builds with the Developer ID identity, notarizes, staples the ticket and writes `.build/Scribe.zip`. Set `CODE_SIGN_IDENTITY` to use a different Developer ID.
+`release.sh` builds with the `CODE_SIGN_IDENTITY` you set, notarizes, staples the ticket and writes `.build/Scribe.zip`.
 
 ## Data
 
