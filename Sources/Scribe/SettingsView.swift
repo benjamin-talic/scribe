@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import Carbon.HIToolbox
 import ServiceManagement
 import SwiftUI
 import UniformTypeIdentifiers
@@ -9,6 +10,8 @@ struct SettingsView: View {
     @State private var microphones: [AudioInputDevice] = []
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
     @State private var microphonePermission = AVCaptureDevice.authorizationStatus(for: .audio)
+    @State private var isCapturingHotKey = false
+    @State private var hotKeyCaptureMonitor: Any?
     @AppStorage(microphoneDeviceUIDKey) private var microphoneDeviceUID = ""
     @AppStorage(notesApplicationPathKey) private var notesApplicationPath = ""
     @AppStorage(systemAudioPermissionGrantedKey) private var systemAudioPermissionGranted = false
@@ -41,6 +44,31 @@ struct SettingsView: View {
                     ForEach(microphones) { microphone in
                         Text(microphone.name).tag(microphone.id)
                     }
+                }
+            }
+
+            Section("Dictation") {
+                LabeledContent("Toggle shortcut") {
+                    HStack {
+                        if isCapturingHotKey {
+                            Text("Press a key combination…")
+                                .foregroundStyle(.secondary)
+                            Button("Cancel", action: stopHotKeyCapture)
+                        } else {
+                            Text(state.dictationHotKey.displayString)
+                            Button("Change…", action: startHotKeyCapture)
+                            Button("Reset") { state.setDictationHotKey(.default) }
+                                .disabled(state.dictationHotKey == .default)
+                        }
+                    }
+                }
+                Text("Dictation records from the microphone above and copies the recognized text to the clipboard.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if let hotKeyError = state.hotKeyError {
+                    Text(hotKeyError)
+                        .font(.caption)
+                        .foregroundStyle(.red)
                 }
             }
 
@@ -80,6 +108,28 @@ struct SettingsView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             Task { await refresh() }
         }
+        .onDisappear { stopHotKeyCapture() }
+    }
+
+    private func startHotKeyCapture() {
+        isCapturingHotKey = true
+        hotKeyCaptureMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { event in
+            guard event.type == .keyDown else { return event }
+            guard event.keyCode != UInt16(kVK_Escape) else {
+                stopHotKeyCapture()
+                return nil
+            }
+            guard let hotKey = DictationHotKey.captured(from: event) else { return nil }
+            state.setDictationHotKey(hotKey)
+            stopHotKeyCapture()
+            return nil
+        }
+    }
+
+    private func stopHotKeyCapture() {
+        isCapturingHotKey = false
+        if let hotKeyCaptureMonitor { NSEvent.removeMonitor(hotKeyCaptureMonitor) }
+        hotKeyCaptureMonitor = nil
     }
 
     @ViewBuilder

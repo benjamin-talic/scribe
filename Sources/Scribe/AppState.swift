@@ -1,4 +1,5 @@
 import AppKit
+import Carbon.HIToolbox
 import Observation
 
 let notesApplicationPathKey = "notesApplicationPath"
@@ -11,7 +12,20 @@ final class AppState {
         case recording(startedAt: Date)
     }
 
+    enum DictationState: Equatable {
+        case idle
+        case starting
+        case recording(startedAt: Date)
+        case processing
+        case copied
+        case failed(String)
+    }
+
     var recordingState: RecordingState = .idle
+    var dictationState: DictationState = .idle
+    var dictationHotKey: DictationHotKey
+    var dictationHotKeyRegistrar: ((DictationHotKey) -> OSStatus)?
+    var hotKeyError: String?
     var pendingTranscriptions = 0
     var storageError: String?
     var meetingDetectionError: String?
@@ -27,27 +41,55 @@ final class AppState {
     var onRecordingStarted: (() -> Void)?
     private var recordingApplication: MeetingApplication?
     private var recordingStartInProgress = false
+    private var recordingStartTask: Task<Void, Never>?
     private var recordingStopInProgress = false
+    private var dictationEpoch = 0
+    /// Every in-flight `stop()` operation, keyed by its generation — including ones the user has
+    /// already cancelled at the UI level. An entry is only removed once its own Task finishes, so
+    /// `shutdown()` can await every task-owned temp-file cleanup, not just the current generation.
+    private var dictationTasks: [Int: Task<Void, Never>] = [:]
+    private var dictationResetTask: Task<Void, Never>?
+    private var isShuttingDown = false
     private var deletingNoteIDs: Set<URL> = []
     private let sessionStore: SessionStore?
     private let recorder: (any RecordingControlling)?
     private let processingQueue: ProcessingQueue?
+    private let dictationController: (any DictationControlling)?
+    private let pasteboard: any DictationPasteboard
+    private let hotKeyDefaults: UserDefaults
 
     init(
         sessionStore: SessionStore? = nil,
         recorder: (any RecordingControlling)? = nil,
         processingQueue: ProcessingQueue? = nil,
+        dictationController: (any DictationControlling)? = nil,
+        pasteboard: any DictationPasteboard = NSPasteboard.general,
+        hotKeyDefaults: UserDefaults = .standard,
         storageError: String? = nil
     ) {
         self.sessionStore = sessionStore
         self.recorder = recorder
         self.processingQueue = processingQueue
+        self.dictationController = dictationController
+        self.pasteboard = pasteboard
+        self.hotKeyDefaults = hotKeyDefaults
+        self.dictationHotKey = .loadPersisted(from: hotKeyDefaults)
         self.storageError = storageError
     }
 
     var isRecording: Bool {
         if case .recording = recordingState { return true }
         return false
+    }
+
+    /// True while dictation owns (or is claiming) capture hardware or a decode — i.e. every phase
+    /// EXCEPT the transient `.copied`/`.failed` feedback, so that feedback window doesn't block
+    /// meeting recording from starting.
+    var isDictationBusy: Bool {
+        switch dictationState {
+        case .starting, .recording, .processing: true
+        case .idle, .copied, .failed: false
+        }
     }
 
     func statusText(at date: Date) -> String {
@@ -102,11 +144,33 @@ final class AppState {
         }
     }
 
+    /// Wraps the actual start in a Task stored in `recordingStartTask` so `shutdown()` — running on
+    /// a different call stack — can await the exact same in-flight operation, rather than relying
+    /// on `startRecording` to notice a shutdown after the fact (by which point `shutdown()` may
+    /// already have returned). Every menu/toast/manual call site goes through this one method, so
+    /// this tracking covers all of them without any call-site changes.
     func startRecording(for application: MeetingApplication? = nil, at date: Date = .now) async {
-        guard let recorder, !isRecording, !recordingStartInProgress else { return }
+        guard let recorder, !isRecording, !recordingStartInProgress, !isShuttingDown else { return }
+        guard !isDictationBusy else {
+            recordingError = "Stop dictation before recording a meeting."
+            return
+        }
         recordingStartInProgress = true
-        defer { recordingStartInProgress = false }
 
+        let task: Task<Void, Never> = Task { [weak self] in
+            await self?.performStartRecording(recorder: recorder, application: application, at: date)
+        }
+        recordingStartTask = task
+        await task.value
+        recordingStartInProgress = false
+        recordingStartTask = nil
+    }
+
+    private func performStartRecording(
+        recorder: any RecordingControlling,
+        application: MeetingApplication?,
+        at date: Date
+    ) async {
         do {
             let session = try await recorder.start(for: application, at: date)
             recordingState = .recording(startedAt: session.startedAt)
@@ -150,6 +214,145 @@ final class AppState {
 
     var manualRecordingApplication: MeetingApplication? {
         activeMeetingApplications.count == 1 ? activeMeetingApplications.first : nil
+    }
+
+    /// Pressing the toggle while permission is pending (`.starting`) cancels the pending start,
+    /// matching the panel's own Cancel affordance for that phase.
+    func toggleDictation(at date: Date = .now) async {
+        switch dictationState {
+        case .idle, .copied, .failed:
+            await startDictation(at: date)
+        case .starting:
+            cancelDictation()
+        case .recording:
+            requestStopDictation()
+        case .processing:
+            break
+        }
+    }
+
+    func startDictation(at date: Date = .now) async {
+        guard let dictationController, !isDictationBusy, !isShuttingDown else { return }
+        guard !isRecording, !recordingStartInProgress else {
+            dictationState = .failed("Stop the meeting recording before dictating.")
+            scheduleDictationReset()
+            return
+        }
+        dictationEpoch += 1
+        let epoch = dictationEpoch
+        dictationResetTask?.cancel()
+        dictationState = .starting
+
+        do {
+            try await dictationController.start(generation: epoch)
+            guard epoch == dictationEpoch, !isShuttingDown else { return }
+            dictationState = .recording(startedAt: date)
+        } catch {
+            guard epoch == dictationEpoch, !isShuttingDown else { return }
+            dictationState = .failed(error.localizedDescription)
+            scheduleDictationReset()
+        }
+    }
+
+    /// Fire-and-track: the actual stop/transcribe runs on a Task owned by `dictationTasks`, keyed
+    /// by this operation's generation, so `shutdown()` can await it even if the UI has already
+    /// moved on (e.g. the user cancelled while it was still processing).
+    func requestStopDictation() {
+        guard let dictationController, case .recording = dictationState, !isShuttingDown else { return }
+        let epoch = dictationEpoch
+        dictationState = .processing
+        dictationTasks[epoch] = Task { [weak self] in
+            await self?.runStopDictation(epoch: epoch, controller: dictationController)
+        }
+    }
+
+    private func runStopDictation(epoch: Int, controller: any DictationControlling) async {
+        defer { dictationTasks.removeValue(forKey: epoch) }
+        do {
+            let text = try await controller.stop(generation: epoch)
+            guard epoch == dictationEpoch, !isShuttingDown else { return }
+            guard pasteboard.writeText(text) else {
+                dictationState = .failed("Could not copy the transcript to the clipboard.")
+                scheduleDictationReset()
+                return
+            }
+            dictationState = .copied
+            scheduleDictationReset()
+        } catch {
+            guard epoch == dictationEpoch, !isShuttingDown else { return }
+            dictationState = .failed(error.localizedDescription)
+            scheduleDictationReset()
+        }
+    }
+
+    /// Synchronous and immediate: invalidates the current generation so any later completion
+    /// (a pending `start()` past its permission await, or an in-flight `stop()`) is discarded
+    /// rather than clearing newer state or hardware it no longer owns.
+    func cancelDictation() {
+        guard dictationState != .idle else { return }
+        dictationResetTask?.cancel()
+        switch dictationState {
+        case .starting, .recording:
+            dictationController?.cancel(generation: dictationEpoch)
+        case .processing:
+            dictationTasks[dictationEpoch]?.cancel()
+        case .idle, .copied, .failed:
+            break
+        }
+        dictationEpoch += 1
+        dictationState = .idle
+    }
+
+    /// Called on Quit. Invalidates every dictation generation and cancels any owned capture
+    /// synchronously, BEFORE any await, so a pending transcript from a stale generation cannot
+    /// copy to the clipboard while the awaits below are in flight. Then drains an in-flight
+    /// meeting start (a post-await `isShuttingDown` check inside `startRecording` alone isn't
+    /// enough — `shutdown()` could already have returned by the time that check runs — so
+    /// `shutdown()` itself awaits the exact same tracked task), stops/finalizes any recording that
+    /// start resolved to, and finally waits for every task-owned dictation temp file to actually
+    /// finish cleaning up — including tasks for generations the user already cancelled — before
+    /// returning, so `NSApp.terminate` never kills any of this mid-flight.
+    func shutdown() async {
+        isShuttingDown = true
+        cancelDictation()
+
+        if let recordingStartTask {
+            await recordingStartTask.value
+        }
+        await stopRecording()
+
+        for task in dictationTasks.values {
+            await task.value
+        }
+    }
+
+    /// Re-registering the shortcut currently in effect is a no-op. Otherwise the new shortcut is
+    /// registered before anything is persisted or replaces `dictationHotKey`; a failed
+    /// registration leaves the previous, still-working shortcut untouched and reports why.
+    func setDictationHotKey(_ hotKey: DictationHotKey) {
+        guard hotKey != dictationHotKey else { return }
+        guard let registrar = dictationHotKeyRegistrar else {
+            dictationHotKey = hotKey
+            hotKey.persist(to: hotKeyDefaults)
+            return
+        }
+        let status = registrar(hotKey)
+        guard status == noErr else {
+            hotKeyError = "Could not register that shortcut (status \(status)). Keeping the previous one."
+            return
+        }
+        dictationHotKey = hotKey
+        hotKey.persist(to: hotKeyDefaults)
+        hotKeyError = nil
+    }
+
+    private func scheduleDictationReset() {
+        dictationResetTask?.cancel()
+        dictationResetTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(4))
+            guard !Task.isCancelled else { return }
+            self?.dictationState = .idle
+        }
     }
 
     func loadLibrary() async {

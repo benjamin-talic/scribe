@@ -15,6 +15,7 @@ Scribe is a macOS menu bar app that records meetings, transcribes them locally, 
 - Opens notes in an app of your choice, selected in Settings.
 - Recovers interrupted processing and retries failures.
 - Removes raw audio five days after transcription while retaining notes and retryable data.
+- Dictates to the clipboard: toggle from the menu bar (**Dictate**) or a configurable global shortcut (default `⇧⌘D`, changeable in Settings). Records from the selected microphone only, transcribes locally with WhisperKit, and copies the plain recognized text to the clipboard — no timestamps, speaker labels, notes, or auto-paste. Output preserves your actual words and meaning: no paraphrasing, polishing, grammar rewrites, or summarizing. Punctuation/case pass through exactly as WhisperKit produces them; only whitespace is normalized — no words, including filler, acronyms, or repetitions and self-corrections, are ever removed. A floating indicator shows Stop/Cancel, transcribing progress, and a copied/failed result; it never steals focus from your current app. Cancelling, or an empty/failed transcription, leaves the clipboard untouched. Dictation and meeting recording are mutually exclusive — stop one to start the other.
 
 ## Requirements
 

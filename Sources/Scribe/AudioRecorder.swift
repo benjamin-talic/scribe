@@ -89,6 +89,7 @@ final class RecordingController: RecordingControlling {
         case noInputFormat
         case noMatchingAudioProcess
         case systemAudioPermissionDenied
+        case selectedMicrophoneUnavailable
 
         var errorDescription: String? {
             switch self {
@@ -99,6 +100,7 @@ final class RecordingController: RecordingControlling {
             case .noInputFormat: "The microphone has no available input format."
             case .noMatchingAudioProcess: "No audio process was found for the detected meeting app."
             case .systemAudioPermissionDenied: "System Audio Recording permission is required to capture other speakers."
+            case .selectedMicrophoneUnavailable: "The selected microphone is disconnected. Choose another microphone in Settings."
             }
         }
     }
@@ -161,9 +163,9 @@ final class RecordingController: RecordingControlling {
         guard let active else { throw Error.notRecording }
         defer { self.active = nil }
 
-        active.microphone.stop()
+        let microphoneFailure = active.microphone.finalize()
         active.systemAudio.stop()
-        let failures = [active.microphone.failure, active.systemAudio.failure].compactMap { $0 }
+        let failures = [microphoneFailure, active.systemAudio.failure].compactMap { $0 }
 
         let session = try await sessionStore.finishRecording(
             active.session.id,
@@ -176,10 +178,11 @@ final class RecordingController: RecordingControlling {
     }
 }
 
-private final class AudioFileWriter: @unchecked Sendable {
+final class AudioFileWriter: @unchecked Sendable {
     private struct State {
         var failure: String?
         var firstHostTime: UInt64?
+        var isClosed = false
     }
 
     private let file: ExtAudioFileRef
@@ -221,23 +224,56 @@ private final class AudioFileWriter: @unchecked Sendable {
         write(buffer.audioBufferList, frames: buffer.frameLength, hostTime: hostTime)
     }
 
+    /// The closed-check, the actual `ExtAudioFileWriteAsync` call, and the metadata update all
+    /// happen under the same lock `close()` disposes under — `removeTap`/`engine.stop()` cannot be
+    /// trusted to drain an audio callback that has already entered this function, so the writer
+    /// itself, not the caller, is what must serialize a write against a concurrent close.
     func write(_ buffers: UnsafePointer<AudioBufferList>, frames: UInt32, hostTime: UInt64) {
-        let status = ExtAudioFileWriteAsync(file, frames, buffers)
-        state.withLock {
-            if hostTime != 0 { $0.firstHostTime = $0.firstHostTime ?? hostTime }
-            if status != noErr { $0.failure = $0.failure ?? "Audio file write failed with status \(status)." }
+        // UnsafePointer isn't Sendable, so it's passed into the @Sendable lock closure as a bit
+        // pattern and reconstructed inside — the pointer is only ever dereferenced synchronously,
+        // still on this same call stack, under the lock.
+        let buffersAddress = Int(bitPattern: buffers)
+        state.withLock { state in
+            guard !state.isClosed, let pointer = UnsafePointer<AudioBufferList>(bitPattern: buffersAddress) else {
+                return
+            }
+            let status = ExtAudioFileWriteAsync(file, frames, pointer)
+            if hostTime != 0 { state.firstHostTime = state.firstHostTime ?? hostTime }
+            if status != noErr { state.failure = state.failure ?? "Audio file write failed with status \(status)." }
         }
     }
 
     var firstHostTime: UInt64? { state.withLock { $0.firstHostTime } }
     var failure: String? { state.withLock { $0.failure } }
 
+    /// Idempotent: disposes the file exactly once, merging any dispose failure into the same
+    /// failure state as write errors. Callers must ensure no `write` is still in flight.
+    @discardableResult
+    func close() -> String? {
+        state.withLock { state in
+            guard !state.isClosed else { return state.failure }
+            state.isClosed = true
+            let status = ExtAudioFileDispose(file)
+            if status != noErr {
+                state.failure = state.failure ?? "Closing the audio file failed with status \(status)."
+            }
+            return state.failure
+        }
+    }
+
     deinit {
-        ExtAudioFileDispose(file)
+        let alreadyClosed = state.withLock { state -> Bool in
+            let was = state.isClosed
+            state.isClosed = true
+            return was
+        }
+        if !alreadyClosed {
+            ExtAudioFileDispose(file)
+        }
     }
 }
 
-private final class MicrophoneCapture {
+final class MicrophoneCapture {
     private let url: URL
     private let deviceUID: String?
     private let engine = AVAudioEngine()
@@ -250,8 +286,13 @@ private final class MicrophoneCapture {
     }
 
     func start() throws {
+        // Resolved before touching `engine.inputNode` at all: merely accessing that property can
+        // itself trigger microphone hardware configuration (and the TCC permission prompt) on
+        // some macOS versions, so an invalid selected UID must fail before any engine access.
+        let selectedDeviceID = try SelectedMicrophoneResolver.resolve(uid: deviceUID)
+
         let input = engine.inputNode
-        if var objectID = try selectedDeviceID(), let audioUnit = input.audioUnit {
+        if var objectID = selectedDeviceID, let audioUnit = input.audioUnit {
             let status = AudioUnitSetProperty(
                 audioUnit,
                 kAudioOutputUnitProperty_CurrentDevice,
@@ -260,7 +301,7 @@ private final class MicrophoneCapture {
                 &objectID,
                 UInt32(MemoryLayout.size(ofValue: objectID))
             )
-            if status != noErr, try selectedDeviceID() != nil {
+            if status != noErr {
                 throw RecordingController.Error.audio("selecting the microphone", status)
             }
         }
@@ -286,21 +327,38 @@ private final class MicrophoneCapture {
         engine.stop()
     }
 
+    /// Stops audio callbacks (`stop()`) before closing the writer, so no write can race a close,
+    /// then flushes/closes the file. Callers reading the captured file must wait for this to
+    /// return first — `stop()` alone leaves the writer's `ExtAudioFile` open.
+    @discardableResult
+    func finalize() -> String? {
+        stop()
+        return writer?.close()
+    }
+
     var firstHostTime: UInt64? { writer?.firstHostTime }
     var failure: String? { writer?.failure }
+}
 
-    private func selectedDeviceID() throws -> AudioObjectID? {
-        guard let deviceUID, !deviceUID.isEmpty else { return nil }
+/// Translates a persisted microphone UID to a CoreAudio device — pure device enumeration via
+/// `AudioObjectGetPropertyData`, with no dependency on `AVAudioEngine` and no interaction with
+/// the microphone capture permission at all, so it's safe to call from a unit test or before any
+/// audio hardware is touched. Returns nil for "use the default device" (no UID persisted) but
+/// throws when a persisted UID is set and can't be resolved — a disconnected selected microphone
+/// must be a visible error, never a silent fallback to whatever device happens to be default.
+enum SelectedMicrophoneResolver {
+    static func resolve(uid: String?) throws -> AudioObjectID? {
+        guard let uid, !uid.isEmpty else { return nil }
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyTranslateUIDToDevice,
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain
         )
-        var uid = deviceUID as CFString
+        var cfUID = uid as CFString
         var objectID = kAudioObjectUnknown
         var size = UInt32(MemoryLayout.size(ofValue: objectID))
-        let uidSize = UInt32(MemoryLayout.size(ofValue: uid))
-        let status = withUnsafePointer(to: &uid) {
+        let uidSize = UInt32(MemoryLayout.size(ofValue: cfUID))
+        let status = withUnsafePointer(to: &cfUID) {
             AudioObjectGetPropertyData(
                 AudioObjectID(kAudioObjectSystemObject),
                 &address,
@@ -313,7 +371,10 @@ private final class MicrophoneCapture {
         guard status == noErr else {
             throw RecordingController.Error.audio("finding the selected microphone", status)
         }
-        return objectID == kAudioObjectUnknown ? nil : objectID
+        guard objectID != kAudioObjectUnknown else {
+            throw RecordingController.Error.selectedMicrophoneUnavailable
+        }
+        return objectID
     }
 }
 
@@ -396,6 +457,7 @@ private final class ProcessTapCapture {
             AudioHardwareDestroyProcessTap(tapID)
             tapID = kAudioObjectUnknown
         }
+        writer?.close()
     }
 
     var firstHostTime: UInt64? { writer?.firstHostTime }

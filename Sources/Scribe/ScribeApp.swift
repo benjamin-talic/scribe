@@ -1,4 +1,5 @@
 import AppKit
+import Carbon.HIToolbox
 import SwiftUI
 
 @main
@@ -6,6 +7,8 @@ struct ScribeApp: App {
     @State private var state: AppState
     private let meetingDetector: MeetingDetector
     private let meetingNotifications: MeetingNotifications
+    private let dictationHotKeyMonitor: GlobalHotKeyMonitor
+    private let dictationIndicator: DictationIndicatorController
 
     init() {
         let state: AppState
@@ -14,12 +17,25 @@ struct ScribeApp: App {
             state = AppState(
                 sessionStore: store,
                 recorder: RecordingController(sessionStore: store),
-                processingQueue: ProcessingQueue(sessionStore: store)
+                processingQueue: ProcessingQueue(sessionStore: store),
+                dictationController: DictationController()
             )
         } catch {
-            state = AppState(storageError: error.localizedDescription)
+            state = AppState(dictationController: DictationController(), storageError: error.localizedDescription)
         }
         _state = State(initialValue: state)
+
+        let hotKeyMonitor = GlobalHotKeyMonitor()
+        hotKeyMonitor.onTrigger = { [weak state] in
+            Task { @MainActor in await state?.toggleDictation() }
+        }
+        state.dictationHotKeyRegistrar = { [weak hotKeyMonitor] hotKey in hotKeyMonitor?.register(hotKey) ?? OSStatus(eventNotHandledErr) }
+        let initialHotKeyStatus = hotKeyMonitor.register(state.dictationHotKey)
+        if initialHotKeyStatus != noErr {
+            state.hotKeyError = "Could not register the dictation shortcut (status \(initialHotKeyStatus))."
+        }
+        dictationHotKeyMonitor = hotKeyMonitor
+        dictationIndicator = DictationIndicatorController(state: state)
 
         let detector = MeetingDetector()
         let notifications = MeetingNotifications()
@@ -196,6 +212,24 @@ private struct MenuView: View {
                 .buttonStyle(.borderedProminent)
                 .buttonBorderShape(.roundedRectangle(radius: 9))
                 .tint(state.isRecording ? .red : .accentColor)
+                .disabled(state.isDictationBusy)
+
+                Button {
+                    Task { await state.toggleDictation() }
+                } label: {
+                    HStack {
+                        Image(systemName: dictateIcon)
+                        Text(dictateTitle)
+                            .fontWeight(.semibold)
+                        Spacer()
+                    }
+                    .padding(.horizontal, 12)
+                    .frame(maxWidth: .infinity, minHeight: 34)
+                }
+                .buttonStyle(.bordered)
+                .buttonBorderShape(.roundedRectangle(radius: 9))
+                .disabled(state.isRecording || state.dictationState == .processing)
+                .help("Toggle with \(state.dictationHotKey.displayString)")
 
                 Button {
                     openWindow(id: "library")
@@ -223,7 +257,7 @@ private struct MenuView: View {
 
             Button {
                 Task {
-                    await state.stopRecording()
+                    await state.shutdown()
                     NSApp.terminate(nil)
                 }
             } label: {
@@ -239,6 +273,22 @@ private struct MenuView: View {
             .buttonStyle(.plain)
         }
         .frame(width: 300)
+    }
+
+    private var dictateIcon: String {
+        switch state.dictationState {
+        case .recording: "mic.slash.fill"
+        default: "mic"
+        }
+    }
+
+    private var dictateTitle: String {
+        switch state.dictationState {
+        case .starting: "Starting…"
+        case .recording: "Stop Dictating"
+        case .processing: "Transcribing…"
+        default: "Dictate"
+        }
     }
 
     private var statusSubtitle: String {
@@ -324,6 +374,7 @@ private struct LibraryView: View {
                 )
             }
             .tint(state.isRecording ? .red : nil)
+            .disabled(state.isDictationBusy)
         }
         .onAppear {
             NSApp.setActivationPolicy(.regular)
