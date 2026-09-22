@@ -57,6 +57,7 @@ final class AppState {
     private let dictationController: (any DictationControlling)?
     private let pasteboard: any DictationPasteboard
     private let hotKeyDefaults: UserDefaults
+    private let dictationTiming: any DictationTiming
 
     init(
         sessionStore: SessionStore? = nil,
@@ -65,6 +66,7 @@ final class AppState {
         dictationController: (any DictationControlling)? = nil,
         pasteboard: any DictationPasteboard = NSPasteboard.general,
         hotKeyDefaults: UserDefaults = .standard,
+        dictationTiming: any DictationTiming = OSLogDictationTiming(),
         storageError: String? = nil
     ) {
         self.sessionStore = sessionStore
@@ -73,6 +75,7 @@ final class AppState {
         self.dictationController = dictationController
         self.pasteboard = pasteboard
         self.hotKeyDefaults = hotKeyDefaults
+        self.dictationTiming = dictationTiming
         self.dictationHotKey = .loadPersisted(from: hotKeyDefaults)
         self.storageError = storageError
     }
@@ -261,21 +264,28 @@ final class AppState {
         guard let dictationController, case .recording = dictationState, !isShuttingDown else { return }
         let epoch = dictationEpoch
         dictationState = .processing
+        let stopRequestedAt = ContinuousClock.now
         dictationTasks[epoch] = Task { [weak self] in
-            await self?.runStopDictation(epoch: epoch, controller: dictationController)
+            await self?.runStopDictation(epoch: epoch, controller: dictationController, stopRequestedAt: stopRequestedAt)
         }
     }
 
-    private func runStopDictation(epoch: Int, controller: any DictationControlling) async {
+    private func runStopDictation(
+        epoch: Int,
+        controller: any DictationControlling,
+        stopRequestedAt: ContinuousClock.Instant
+    ) async {
         defer { dictationTasks.removeValue(forKey: epoch) }
         do {
             let text = try await controller.stop(generation: epoch)
+            dictationTiming.recordDuration("dictation.stopToResult", ContinuousClock.now - stopRequestedAt)
             guard epoch == dictationEpoch, !isShuttingDown else { return }
             guard pasteboard.writeText(text) else {
                 dictationState = .failed("Could not copy the transcript to the clipboard.")
                 scheduleDictationReset()
                 return
             }
+            dictationTiming.recordDuration("dictation.stopToClipboard", ContinuousClock.now - stopRequestedAt)
             dictationState = .copied
             scheduleDictationReset()
         } catch {
@@ -324,6 +334,8 @@ final class AppState {
         for task in dictationTasks.values {
             await task.value
         }
+
+        await dictationController?.shutdown()
     }
 
     /// Re-registering the shortcut currently in effect is a no-op. Otherwise the new shortcut is

@@ -16,6 +16,7 @@ Scribe is a macOS menu bar app that records meetings, transcribes them locally, 
 - Recovers interrupted processing and retries failures.
 - Removes raw audio five days after transcription while retaining notes and retryable data.
 - Dictates to the clipboard: toggle from the menu bar (**Dictate**) or a configurable global shortcut (default `⇧⌘D`, changeable in Settings). Records from the selected microphone only, transcribes locally with WhisperKit, and copies the plain recognized text to the clipboard — no timestamps, speaker labels, notes, or auto-paste. Output preserves your actual words and meaning: no paraphrasing, polishing, grammar rewrites, or summarizing. Punctuation/case pass through exactly as WhisperKit produces them; only whitespace is normalized — no words, including filler, acronyms, or repetitions and self-corrections, are ever removed. A floating indicator shows Stop/Cancel, transcribing progress, and a copied/failed result; it never steals focus from your current app. Cancelling, or an empty/failed transcription, leaves the clipboard untouched. Dictation and meeting recording are mutually exclusive — stop one to start the other.
+  - The WhisperKit model stays warm in memory between dictations (starting to load as soon as recording begins, in the background) instead of reloading on every Stop, and unloads itself after five minutes of no dictation activity, or immediately on Quit. Load, queue-wait, decode, and stop-to-clipboard timings are logged to the unified log (`log stream --predicate 'subsystem == "local.scribe.dictation"'`) as durations only — never audio, transcript text, or file paths.
 
 ## Requirements
 
@@ -76,3 +77,20 @@ CODE_SIGN_IDENTITY=- ./scripts/build-app.sh
 ```
 
 The build script creates `.build/Scribe.app` and runs the bundle smoke test.
+
+`swift test` never touches a real WhisperKit model. To compare the old per-operation load+decode+unload path against the actual production dictation path (real `AppState`/`DictationController`/`DictationModelCache`, prewarmed while a simulated recording is "in progress") with the real "small" model:
+
+```sh
+say -o fixture.aiff "The quick brown fox jumps over the lazy dog."
+afconvert fixture.aiff fixture.caf -d LEI16@16000 -c 1
+afinfo fixture.caf   # note the duration for SCRIBE_DICTATION_BENCHMARK_LEAD_SECONDS below
+
+SCRIBE_DICTATION_BENCHMARK=1 \
+SCRIBE_DICTATION_BENCHMARK_FIXTURE="$PWD/fixture.caf" \
+SCRIBE_DICTATION_BENCHMARK_LEAD_SECONDS=13.159 \
+SCRIBE_DICTATION_BENCHMARK_SAMPLES=5 \
+SCRIBE_DICTATION_BENCHMARK_REFERENCE_TEXT="The quick brown fox jumps over the lazy dog." \
+swift test --filter DictationBenchmark
+```
+
+`SAMPLES` (default 5) and `LEAD_SECONDS` (default 13.159) are optional; `REFERENCE_TEXT` is optional too — without it, recognized text is still printed but accuracy is reported as unchecked rather than silently skipped. Prints old-path and production-path timings per sample plus a recognized-text comparison; see the file header in `Tests/ScribeTests/DictationBenchmark.swift` for what each number means and its OS-cache-state caveats.

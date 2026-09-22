@@ -270,13 +270,13 @@ struct DictationTests {
         // faked) with real AppState and a fake pasteboard, so the whitespace-then-empty guard is
         // exercised end to end, not just at the controller unit level.
         let capture = FakeCapture()
-        let transcriber = FakeTranscriber()
+        let transcriber = FakeDictationTranscriber()
         transcriber.result = .success("  \n\t  ")
         let controller = DictationController(
             makeCapture: { _, _ in capture },
-            loadTranscriber: { transcriber },
             requestMicrophoneAccess: { true },
-            selectedMicrophoneUID: { nil }
+            selectedMicrophoneUID: { nil },
+            cache: DictationModelCache(loadTranscriber: { transcriber })
         )
         let pasteboard = FakePasteboard(initial: "sentinel")
         let state = AppState(dictationController: controller, pasteboard: pasteboard)
@@ -290,7 +290,7 @@ struct DictationTests {
             return
         }
         #expect(pasteboard.lastWritten == "sentinel")
-        #expect(transcriber.calls == ["transcribe", "unload"])
+        #expect(transcriber.calls == ["transcribe"])
     }
 
     @Test
@@ -363,15 +363,15 @@ private func waitUntil(
 @MainActor
 struct DictationControllerTests {
     @Test
-    func finalizeRunsBeforeTranscribeAndUnloadRunsAfter() async throws {
+    func finalizeRunsBeforeTranscribeAndModelStaysWarmAfterSuccess() async throws {
         let capture = FakeCapture()
-        let transcriber = FakeTranscriber()
+        let transcriber = FakeDictationTranscriber()
         transcriber.result = .success("real words")
         let controller = DictationController(
             makeCapture: { _, _ in capture },
-            loadTranscriber: { transcriber },
             requestMicrophoneAccess: { true },
-            selectedMicrophoneUID: { nil }
+            selectedMicrophoneUID: { nil },
+            cache: DictationModelCache(loadTranscriber: { transcriber })
         )
 
         try await controller.start(generation: 1)
@@ -379,37 +379,39 @@ struct DictationControllerTests {
 
         #expect(text == "real words")
         #expect(capture.calls == ["start", "finalize"])
-        #expect(transcriber.calls == ["transcribe", "unload"])
+        // No unload on the success path any more — the model stays warm for reuse; only the idle
+        // timer or shutdown ever unloads it now.
+        #expect(transcriber.calls == ["transcribe"])
     }
 
     @Test
-    func modelUnloadsAfterFailedTranscriptionNeverMidDecode() async {
+    func modelStaysWarmAfterFailedTranscriptionForRetry() async {
         let capture = FakeCapture()
-        let transcriber = FakeTranscriber()
+        let transcriber = FakeDictationTranscriber()
         transcriber.result = .failure(DictationController.Error.emptyTranscript)
         let controller = DictationController(
             makeCapture: { _, _ in capture },
-            loadTranscriber: { transcriber },
             requestMicrophoneAccess: { true },
-            selectedMicrophoneUID: { nil }
+            selectedMicrophoneUID: { nil },
+            cache: DictationModelCache(loadTranscriber: { transcriber })
         )
 
         try? await controller.start(generation: 1)
         _ = try? await controller.stop(generation: 1)
 
-        #expect(transcriber.calls == ["transcribe", "unload"])
+        #expect(transcriber.calls == ["transcribe"])
     }
 
     @Test
-    func whitespaceOnlyResultIsNormalizedThenRejectedAndUnloadsExactlyOnce() async {
+    func whitespaceOnlyResultIsNormalizedThenRejectedWithoutUnloading() async {
         let capture = FakeCapture()
-        let transcriber = FakeTranscriber()
+        let transcriber = FakeDictationTranscriber()
         transcriber.result = .success("  \n\t  ")
         let controller = DictationController(
             makeCapture: { _, _ in capture },
-            loadTranscriber: { transcriber },
             requestMicrophoneAccess: { true },
-            selectedMicrophoneUID: { nil }
+            selectedMicrophoneUID: { nil },
+            cache: DictationModelCache(loadTranscriber: { transcriber })
         )
         try? await controller.start(generation: 1)
 
@@ -417,19 +419,19 @@ struct DictationControllerTests {
             try await controller.stop(generation: 1)
         }
 
-        #expect(transcriber.calls == ["transcribe", "unload"])
+        #expect(transcriber.calls == ["transcribe"])
     }
 
     @Test
-    func emptyResultIsRejectedAndUnloadsExactlyOnce() async {
+    func emptyResultIsRejectedWithoutUnloading() async {
         let capture = FakeCapture()
-        let transcriber = FakeTranscriber()
+        let transcriber = FakeDictationTranscriber()
         transcriber.result = .success("")
         let controller = DictationController(
             makeCapture: { _, _ in capture },
-            loadTranscriber: { transcriber },
             requestMicrophoneAccess: { true },
-            selectedMicrophoneUID: { nil }
+            selectedMicrophoneUID: { nil },
+            cache: DictationModelCache(loadTranscriber: { transcriber })
         )
         try? await controller.start(generation: 1)
 
@@ -437,19 +439,21 @@ struct DictationControllerTests {
             try await controller.stop(generation: 1)
         }
 
-        #expect(transcriber.calls == ["transcribe", "unload"])
+        #expect(transcriber.calls == ["transcribe"])
     }
 
     @Test
-    func checkCancellationSkipsModelLoadWhenAlreadyCancelledBeforeStop() async {
+    func checkCancellationSkipsDecodeRequestWhenAlreadyCancelledBeforeStop() async {
+        // start() now also kicks off a best-effort prewarm load unconditionally, so a load can
+        // legitimately happen regardless of whether stop() itself is cancelled — what must never
+        // happen is an actual decode request for a cancelled stop().
         let capture = FakeCapture()
-        let transcriber = FakeTranscriber()
-        let loadCount = OSAllocatedUnfairLock(initialState: 0)
+        let transcriber = FakeDictationTranscriber()
         let controller = DictationController(
             makeCapture: { _, _ in capture },
-            loadTranscriber: { loadCount.withLock { $0 += 1 }; return transcriber },
             requestMicrophoneAccess: { true },
-            selectedMicrophoneUID: { nil }
+            selectedMicrophoneUID: { nil },
+            cache: DictationModelCache(loadTranscriber: { transcriber })
         )
         try? await controller.start(generation: 1)
 
@@ -457,7 +461,7 @@ struct DictationControllerTests {
         task.cancel()
         _ = try? await task.value
 
-        #expect(loadCount.withLock { $0 } == 0)
+        #expect(!transcriber.calls.contains("transcribe"))
     }
 
     @Test
@@ -466,9 +470,9 @@ struct DictationControllerTests {
         let permission = ContinuationBox<Bool>()
         let controller = DictationController(
             makeCapture: { _, _ in capture },
-            loadTranscriber: { FakeTranscriber() },
             requestMicrophoneAccess: { await withCheckedContinuation { permission.store($0) } },
-            selectedMicrophoneUID: { nil }
+            selectedMicrophoneUID: { nil },
+            cache: DictationModelCache(loadTranscriber: { FakeDictationTranscriber() })
         )
 
         let startTask = Task { try await controller.start(generation: 1) }
@@ -479,6 +483,52 @@ struct DictationControllerTests {
 
         await #expect(throws: (any Error).self) { try await startTask.value }
         #expect(capture.calls.isEmpty)
+    }
+
+    @Test
+    func startReturnsWithoutAwaitingPrewarmLoad() async throws {
+        // "Begin best-effort prewarm ... without awaiting it or delaying recording UI": start()
+        // must resolve while the model load is still in flight, not after it.
+        let capture = FakeCapture()
+        let transcriber = FakeDictationTranscriber()
+        let loadGate = ContinuationBox<any DictationTranscribing>()
+        let controller = DictationController(
+            makeCapture: { _, _ in capture },
+            requestMicrophoneAccess: { true },
+            selectedMicrophoneUID: { nil },
+            cache: DictationModelCache(loadTranscriber: {
+                await withCheckedContinuation { loadGate.store($0) }
+            })
+        )
+
+        try await controller.start(generation: 1)
+
+        // start() already returned even though the prewarm load has not resolved yet.
+        #expect(transcriber.calls.isEmpty)
+        loadGate.resume(returning: transcriber)
+    }
+
+    @Test
+    func prewarmedModelIsReusedByTheFollowingStop() async throws {
+        let capture = FakeCapture()
+        let transcriber = FakeDictationTranscriber()
+        transcriber.result = .success("prewarmed result")
+        let loadCount = OSAllocatedUnfairLock(initialState: 0)
+        let controller = DictationController(
+            makeCapture: { _, _ in capture },
+            requestMicrophoneAccess: { true },
+            selectedMicrophoneUID: { nil },
+            cache: DictationModelCache(loadTranscriber: { loadCount.withLock { $0 += 1 }; return transcriber })
+        )
+
+        try await controller.start(generation: 1)
+        // Give the fire-and-forget prewarm Task a chance to actually run and finish loading.
+        try await waitUntil("prewarm loaded") { loadCount.withLock { $0 } == 1 }
+
+        let text = try await controller.stop(generation: 1)
+
+        #expect(text == "prewarmed result")
+        #expect(loadCount.withLock { $0 } == 1)
     }
 
     @Test
@@ -654,19 +704,53 @@ struct AudioFileWriterTests {
 
 // MARK: - Test helpers
 
-private final class ContinuationBox<T: Sendable>: @unchecked Sendable {
-    private let lock = OSAllocatedUnfairLock<CheckedContinuation<T, Never>?>(initialState: nil)
+/// A `resume` that races ahead of its matching `store` (e.g. because a test observed some other
+/// indirect side effect — a counter, an appended call — that happens a moment before the
+/// continuation is actually stored) must not be dropped: it's remembered as a pending value and
+/// delivered as soon as `store` runs, instead of silently no-opping and stranding that `store`'s
+/// continuation forever.
+final class ContinuationBox<T: Sendable>: @unchecked Sendable {
+    private enum State {
+        case empty
+        case stored(CheckedContinuation<T, Never>)
+        case pendingResume(T)
+    }
 
-    var isSet: Bool { lock.withLock { $0 != nil } }
+    private let lock = OSAllocatedUnfairLock<State>(initialState: .empty)
+
+    var isSet: Bool {
+        lock.withLock {
+            if case .stored = $0 { return true }
+            return false
+        }
+    }
 
     func store(_ continuation: CheckedContinuation<T, Never>) {
-        lock.withLock { $0 = continuation }
+        let pending: T? = lock.withLock { state in
+            switch state {
+            case let .pendingResume(value):
+                state = .empty
+                return value
+            case .empty, .stored:
+                state = .stored(continuation)
+                return nil
+            }
+        }
+        if let pending {
+            continuation.resume(returning: pending)
+        }
     }
 
     func resume(returning value: T) {
-        let continuation = lock.withLock { state -> CheckedContinuation<T, Never>? in
-            defer { state = nil }
-            return state
+        let continuation: CheckedContinuation<T, Never>? = lock.withLock { state in
+            switch state {
+            case let .stored(continuation):
+                state = .empty
+                return continuation
+            case .empty, .pendingResume:
+                state = .pendingResume(value)
+                return nil
+            }
         }
         continuation?.resume(returning: value)
     }
@@ -679,6 +763,7 @@ private final class FakeDictationController: DictationControlling {
     var startCalls = 0
     var stopCalls = 0
     var cancelCalls = 0
+    var shutdownCalls = 0
     var startError: (any Error)?
     var stopResult: Result<String, any Error> = .success("hello world")
     var delayStart = false
@@ -704,6 +789,10 @@ private final class FakeDictationController: DictationControlling {
 
     func cancel(generation: Int) {
         cancelCalls += 1
+    }
+
+    func shutdown() async {
+        shutdownCalls += 1
     }
 
     func resumeStart() {
@@ -775,7 +864,7 @@ private final class FakePasteboard: DictationPasteboard {
     }
 }
 
-private final class FakeCapture: DictationCapturing, @unchecked Sendable {
+final class FakeCapture: DictationCapturing, @unchecked Sendable {
     private(set) var calls: [String] = []
     var startError: (any Error)?
     var finalizeFailure: String?
@@ -791,18 +880,42 @@ private final class FakeCapture: DictationCapturing, @unchecked Sendable {
     }
 }
 
-private final class FakeTranscriber: DictationTranscribing, @unchecked Sendable {
-    private let lock = OSAllocatedUnfairLock(initialState: [String]())
-    var result: Result<String, any Error> = .success("hello world")
+/// `isDecoding` is a reentrancy trip-wire: if the cache's serialization ever let two decodes run
+/// concurrently, a second `transcribe(url:)` entering while one is still in flight would find it
+/// already `true` and record a violation instead of silently racing.
+final class FakeDictationTranscriber: DictationTranscribing, @unchecked Sendable {
+    private struct State {
+        var calls: [String] = []
+        var isDecoding = false
+        var overlapDetected = false
+    }
 
-    var calls: [String] { lock.withLock { $0 } }
+    private let lock = OSAllocatedUnfairLock(initialState: State())
+    var result: Result<String, any Error> = .success("hello world")
+    var delayDecode = false
+    private let decodeContinuation = ContinuationBox<Void>()
+
+    var calls: [String] { lock.withLock { $0.calls } }
+    var overlapDetected: Bool { lock.withLock { $0.overlapDetected } }
 
     func transcribe(url: URL) async throws -> String {
-        lock.withLock { $0.append("transcribe") }
+        lock.withLock { state in
+            if state.isDecoding { state.overlapDetected = true }
+            state.isDecoding = true
+            state.calls.append("transcribe")
+        }
+        if delayDecode {
+            await withCheckedContinuation { decodeContinuation.store($0) }
+        }
+        lock.withLock { $0.isDecoding = false }
         return try result.get()
     }
 
+    func resumeDecode() {
+        decodeContinuation.resume(returning: ())
+    }
+
     func unloadModels() async {
-        lock.withLock { $0.append("unload") }
+        lock.withLock { $0.calls.append("unload") }
     }
 }

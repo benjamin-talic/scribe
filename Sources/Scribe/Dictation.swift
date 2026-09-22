@@ -195,6 +195,9 @@ protocol DictationControlling: AnyObject {
     func start(generation: Int) async throws
     func stop(generation: Int) async throws -> String
     func cancel(generation: Int)
+    /// Stops admission and unloads any warm model exactly once. Called from `AppState.shutdown()`
+    /// after every per-operation task has already been drained.
+    func shutdown() async
 }
 
 /// The subset of `MicrophoneCapture` dictation depends on, so tests can inject a fake that never
@@ -277,14 +280,13 @@ final class DictationController: DictationControlling {
     }
 
     typealias CaptureFactory = @Sendable (URL, String?) -> any DictationCapturing
-    typealias TranscriberLoader = @Sendable () async throws -> any DictationTranscribing
     typealias PermissionRequester = @Sendable () async -> Bool
     typealias MicrophoneUIDProvider = @Sendable () -> String?
 
     private let makeCapture: CaptureFactory
-    private let loadTranscriber: TranscriberLoader
     private let requestMicrophoneAccess: PermissionRequester
     private let selectedMicrophoneUID: MicrophoneUIDProvider
+    private let cache: DictationModelCache
 
     private var activeGeneration: Int?
     private var capture: (any DictationCapturing)?
@@ -292,16 +294,16 @@ final class DictationController: DictationControlling {
 
     init(
         makeCapture: @escaping CaptureFactory = { url, uid in MicrophoneCapture(url: url, deviceUID: uid) },
-        loadTranscriber: @escaping TranscriberLoader = { try await WhisperDictationTranscriber.load() },
         requestMicrophoneAccess: @escaping PermissionRequester = { await AVCaptureDevice.requestAccess(for: .audio) },
         selectedMicrophoneUID: @escaping MicrophoneUIDProvider = {
             UserDefaults.standard.string(forKey: microphoneDeviceUIDKey)
-        }
+        },
+        cache: DictationModelCache = DictationModelCache()
     ) {
         self.makeCapture = makeCapture
-        self.loadTranscriber = loadTranscriber
         self.requestMicrophoneAccess = requestMicrophoneAccess
         self.selectedMicrophoneUID = selectedMicrophoneUID
+        self.cache = cache
     }
 
     func start(generation: Int) async throws {
@@ -330,6 +332,13 @@ final class DictationController: DictationControlling {
         }
         capture = mic
         captureURL = url
+
+        // Recording-level demand is held for the whole capture, independent of prewarm's own
+        // (shorter-lived) demand around just its load attempt — so the model stays warm for the
+        // entire time the user is talking, not only until the load itself finishes.
+        await cache.beginDemand()
+        let cache = self.cache
+        Task { await cache.prewarm() }
     }
 
     func stop(generation: Int) async throws -> String {
@@ -339,26 +348,14 @@ final class DictationController: DictationControlling {
         self.captureURL = nil
         defer { try? FileManager.default.removeItem(at: captureURL) }
 
-        if let failure = capture.finalize() {
-            throw Error.captureFailed(failure)
-        }
+        let finalizeFailure = capture.finalize()
+        await cache.endDemand()
+        if let finalizeFailure { throw Error.captureFailed(finalizeFailure) }
         try Task.checkCancellation()
 
-        let transcriber = try await loadTranscriber()
-        let text: String
-        do {
-            try Task.checkCancellation()
-            // Once decoding starts it always runs to completion; unload only ever follows it,
-            // on both the success and failure path, never interrupting an active decode.
-            text = try await transcriber.transcribe(url: captureURL)
-        } catch {
-            await transcriber.unloadModels()
-            throw error
-        }
-        // Unload happens exactly once, here, regardless of whether the cleaned result below turns
-        // out empty — that check must never cause a second unload.
-        await transcriber.unloadModels()
-
+        // No unload here: the cache stays warm for the next dictation and evicts itself only after
+        // being idle for its configured timeout, or on shutdown.
+        let text = try await cache.transcribe(url: captureURL)
         let cleaned = DictationCleanup.clean(text)
         guard !cleaned.isEmpty else { throw Error.emptyTranscript }
         return cleaned
@@ -367,17 +364,233 @@ final class DictationController: DictationControlling {
     func cancel(generation: Int) {
         guard activeGeneration == generation else { return }
         activeGeneration = nil
+        if capture != nil {
+            let cache = self.cache
+            Task { await cache.endDemand() }
+        }
         _ = capture?.finalize()
         if let captureURL { try? FileManager.default.removeItem(at: captureURL) }
         capture = nil
         captureURL = nil
     }
+
+    func shutdown() async {
+        await cache.shutdown()
+    }
+}
+
+enum DictationModelCacheError: LocalizedError {
+    case shuttingDown
+
+    var errorDescription: String? { "Dictation is shutting down." }
+}
+
+/// Owns exactly one lazily-loaded transcriber shared across dictation operations, so repeat
+/// dictations reuse an already-loaded WhisperKit model instead of paying a fresh load on every
+/// Stop. An `actor` alone only guarantees mutual exclusion BETWEEN suspension points — once a
+/// method awaits (loading and decoding both do, extensively), the actor can be re-entered, which
+/// would otherwise let two operations touch the same WhisperKit instance concurrently. `chain(_:)`
+/// is the actual serialization: every load/decode/unload is explicitly ordered behind whatever is
+/// already enqueued, independent of how many times the actor itself is re-entered for bookkeeping
+/// like demand counting.
+actor DictationModelCache {
+    typealias TranscriberLoader = @Sendable () async throws -> any DictationTranscribing
+
+    private let loadTranscriber: TranscriberLoader
+    private let idleTimeout: Duration
+    private let sleeper: any DictationSleeping
+    private let timing: any DictationTiming
+
+    private var transcriber: (any DictationTranscribing)?
+    private var tail: Task<Void, Never> = Task {}
+    private var activeUsers = 0
+    private var idleGeneration = 0
+    private var idleTask: Task<Void, Never>?
+    private var isShutDown = false
+
+    init(
+        loadTranscriber: @escaping TranscriberLoader = { try await WhisperDictationTranscriber.load() },
+        idleTimeout: Duration = .seconds(300),
+        sleeper: any DictationSleeping = SystemDictationSleeper(),
+        timing: any DictationTiming = OSLogDictationTiming()
+    ) {
+        self.loadTranscriber = loadTranscriber
+        self.idleTimeout = idleTimeout
+        self.sleeper = sleeper
+        self.timing = timing
+    }
+
+    /// Held for as long as the model must stay warm for a reason other than an enqueued
+    /// load/decode itself — namely an active recording. `prewarm()` and `transcribe(url:)` also
+    /// hold their own demand internally around just their own work, so idle eviction can never
+    /// fire while anything is actually using, or about to use, the model.
+    func beginDemand() {
+        activeUsers += 1
+        idleTask?.cancel()
+        idleTask = nil
+    }
+
+    func endDemand() {
+        guard activeUsers > 0 else { return }
+        activeUsers -= 1
+        guard activeUsers == 0, !isShutDown else { return }
+        scheduleIdleEviction()
+    }
+
+    /// Best-effort: loads the model if it isn't already warm or loading. Never throws — a failed
+    /// prewarm must not become an unhandled Task error or affect the microphone recording that
+    /// triggered it. `ensureLoaded()` never caches a failure, so the next `transcribe(url:)` (Stop)
+    /// or `prewarm()` retries the load fresh.
+    func prewarm() async {
+        guard !isShutDown else { return }
+        beginDemand()
+        defer { endDemand() }
+        _ = try? await chain { [weak self] in
+            try await self?.ensureLoaded()
+        }
+    }
+
+    func transcribe(url: URL) async throws -> String {
+        guard !isShutDown else { throw DictationModelCacheError.shuttingDown }
+        beginDemand()
+        defer { endDemand() }
+        let enqueuedAt = ContinuousClock.now
+        let timing = self.timing
+        return try await chain { [weak self] in
+            guard let self else { throw DictationModelCacheError.shuttingDown }
+            timing.recordDuration("dictation.queueWait", ContinuousClock.now - enqueuedAt)
+            try await self.ensureLoaded()
+            // Re-checked after the (possibly slow, shared) load: a caller cancelled while queued
+            // behind that load must never reach an actual decode call, even though the load itself
+            // was never cancelled and may still be serving other demand.
+            try Task.checkCancellation()
+            let decodeStart = ContinuousClock.now
+            let text = try await self.performDecode(url: url)
+            timing.recordDuration("dictation.decode", ContinuousClock.now - decodeStart)
+            return text
+        }
+    }
+
+    /// Stops admission, cancels the idle timer, waits for whatever is already enqueued (a load,
+    /// decode, prewarm, or pending eviction) to finish, then unloads exactly once if anything ended
+    /// up loaded — including a prewarm-only session that never reached a decode.
+    func shutdown() async {
+        guard !isShutDown else { return }
+        isShutDown = true
+        idleTask?.cancel()
+        idleTask = nil
+        _ = try? await chain { [weak self] in
+            await self?.unloadUnconditionally()
+        }
+    }
+
+    private func ensureLoaded() async throws {
+        guard transcriber == nil else { return }
+        let start = ContinuousClock.now
+        let loaded = try await loadTranscriber()
+        transcriber = loaded
+        timing.recordDuration("dictation.modelLoad", ContinuousClock.now - start)
+    }
+
+    private func performDecode(url: URL) async throws -> String {
+        guard let transcriber else { throw DictationModelCacheError.shuttingDown }
+        return try await transcriber.transcribe(url: url)
+    }
+
+    private func scheduleIdleEviction() {
+        idleGeneration += 1
+        let generation = idleGeneration
+        let sleeper = self.sleeper
+        let timeout = idleTimeout
+        idleTask = Task { [weak self] in
+            do {
+                try await sleeper.sleep(for: timeout)
+            } catch {
+                return
+            }
+            await self?.evictIfStillIdle(generation: generation)
+        }
+    }
+
+    private func evictIfStillIdle(generation: Int) async {
+        guard generation == idleGeneration, activeUsers == 0, !isShutDown else { return }
+        _ = try? await chain { [weak self] in
+            await self?.unloadIfStillIdle(generation: generation)
+        }
+    }
+
+    private func unloadIfStillIdle(generation: Int) async {
+        guard generation == idleGeneration, activeUsers == 0, !isShutDown else { return }
+        await unloadUnconditionally()
+    }
+
+    private func unloadUnconditionally() async {
+        guard let transcriber else { return }
+        self.transcriber = nil
+        let start = ContinuousClock.now
+        await transcriber.unloadModels()
+        timing.recordDuration("dictation.unload", ContinuousClock.now - start)
+    }
+
+    /// Explicit FIFO serialization: each new unit of work waits for whatever was previously
+    /// enqueued to fully finish (success or failure) before its own body starts, so two
+    /// loads/decodes/unloads can never run concurrently regardless of actor reentrancy. `task` is
+    /// still an unstructured Task, so it does NOT inherit the calling Task's cancellation
+    /// automatically — `withTaskCancellationHandler` bridges that: if the caller (e.g. the
+    /// per-operation Task `AppState` cancels on Cancel/redictate) is cancelled while suspended
+    /// here, `task` itself is cancelled, and its `Task.checkCancellation()` right after awaiting
+    /// `previous.value` — but before `operation()` — skips the operation entirely if it hasn't
+    /// started yet. `previous` (shared work another demand-holder may still need) is never
+    /// cancelled, and if `operation()` had already started running before cancellation arrived, it
+    /// is left to finish normally — `tail` only advances once it actually settles, so the next
+    /// queued item still can't overlap it.
+    @discardableResult
+    private func chain<T: Sendable>(_ operation: @escaping @Sendable () async throws -> T) async throws -> T {
+        let previous = tail
+        let task = Task<T, any Error> {
+            _ = await previous.value
+            try Task.checkCancellation()
+            return try await operation()
+        }
+        tail = Task {
+            _ = try? await task.value
+        }
+        return try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            task.cancel()
+        }
+    }
+}
+
+protocol DictationSleeping: Sendable {
+    func sleep(for duration: Duration) async throws
+}
+
+struct SystemDictationSleeper: DictationSleeping {
+    func sleep(for duration: Duration) async throws {
+        try await Task.sleep(for: duration)
+    }
+}
+
+protocol DictationTiming: Sendable {
+    func recordDuration(_ label: String, _ duration: Duration)
+}
+
+/// Logs only a fixed label and a duration in milliseconds — never audio, transcript text, or file
+/// paths — so dictation timing is safe to leave on by default.
+struct OSLogDictationTiming: DictationTiming {
+    private let logger = Logger(subsystem: "local.scribe.dictation", category: "timing")
+
+    func recordDuration(_ label: String, _ duration: Duration) {
+        let milliseconds = Double(duration.components.seconds) * 1_000
+            + Double(duration.components.attoseconds) / 1e15
+        logger.info("\(label, privacy: .public) \(milliseconds, privacy: .public)ms")
+    }
 }
 
 /// Mic-only, diarization-free transcription for dictation — deliberately separate from the
-/// meeting `LocalTranscriber` in ProcessingQueue.swift, which always loads SpeakerKit. Loaded
-/// fresh per dictation operation (see `DictationController.stop`) rather than cached, so the
-/// model never sits in memory indefinitely and two operations can never share one live instance.
+/// meeting `LocalTranscriber` in ProcessingQueue.swift, which always loads SpeakerKit.
 struct WhisperDictationTranscriber: DictationTranscribing, @unchecked Sendable {
     let whisperKit: WhisperKit
 
